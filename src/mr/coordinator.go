@@ -108,8 +108,13 @@ func (c *Coordinator) GetMapTask(req *TaskRequest, resp *MapResponse) error {
 			LogPrintf("Worker %v got no map task assigned.\n", resp.WorkerId)
 		} else {
 			resp.MapId = -2
-			LogPrintf("There are unfinished map works, the worker %v needs to wait.\n",
-				resp.WorkerId)
+			LogPrintf("There are unfinished map works, the worker %v needs to wait."+
+				" MapFinishCnt=%v, len(mAssignpq)=%v\n",
+				resp.WorkerId, c.mFinishCnt, len(c.mAssignpq))
+			if len(c.mAssignpq) > 0 {
+				LogPrintf("Still unfinished map works. pq top = (id: %v, lastAssignTime: %v), now: %v\n",
+					c.mAssignpq[0].workId, c.mAssignpq[0].lastAssignTime, time.Now().Unix())
+			}
 		}
 	}
 	return nil
@@ -132,7 +137,6 @@ func (c *Coordinator) FinishMap(req *MapFinishMsg, resp *TaskFinishResponse) err
 	resp.AskAgain = true
 	resp.WaitMilli = 100
 	if c.mDoneFlags[req.MapId] {
-		// todo: return error and make the worker delete the intermediate file
 		return fmt.Errorf("the map task: %v has already been completed", req.MapId)
 	}
 
@@ -200,14 +204,19 @@ func (c *Coordinator) GetReduceTask(req *TaskRequest, resp *ReduceResponse) erro
 		resp.FilenameCsv = strings.Join(c.reduceList[item.workId], ",")
 		resp.ReduceId = item.workId
 		item.lastAssignTime = time.Now().Unix()
-		LogPrintf("Re-assign [reduce]:%v to worker: %v\n", item.workId, req.WorkerId)
+		LogPrintf("Re-assign [reduce]:%v to worker: %v\n", resp.ReduceId, req.WorkerId)
 		heap.Push(&c.rAssignpq, item)
 	} else if c.rFinishCnt == c.nReduce {
 		LogPrintf("Worker %v got no reduce task assigned.\n", req.WorkerId)
 	} else {
 		resp.ReduceId = -3
-		LogPrintf("There are unfinished reduce works, the worker %v needs to wait.\n",
-			resp.WorkerId)
+		LogPrintf("There are unfinished reduce works, the worker %v needs to wait."+
+			" ReduceFinishCnt=%v, len(rAssignpq)=%v\n",
+			resp.WorkerId, c.rFinishCnt, len(c.rAssignpq))
+		if len(c.rAssignpq) > 0 {
+			LogPrintf("Still unfinished reduce works. pq top = (id: %v, lastAssignTime: %v), now: %v\n",
+				c.rAssignpq[0].workId, c.rAssignpq[0].lastAssignTime, time.Now().Unix())
+		}
 	}
 	return nil
 }

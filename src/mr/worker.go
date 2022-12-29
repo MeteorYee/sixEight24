@@ -56,11 +56,11 @@ func deleteFiles(files []string) {
 func getMapTask() (*MapResponse, bool) {
 	selfPid := os.Getpid()
 	args := TaskRequest{WorkerId: selfPid}
-	reply := MapResponse{}
-
+	reply := new(MapResponse)
 	for {
+		*reply = MapResponse{}
 		LogPrintf("Worker %v RPC GetMapTask\n", args.WorkerId)
-		ok := call("Coordinator.GetMapTask", &args, &reply)
+		ok := call("Coordinator.GetMapTask", &args, reply)
 		if !ok {
 			log.Fatalln("RPC call failed in getMapTask")
 		}
@@ -68,16 +68,17 @@ func getMapTask() (*MapResponse, bool) {
 		idChecker(selfPid, reply.WorkerId)
 
 		if reply.MapId >= 0 {
-			break
+			LogPrintf("Worker %v got map work %v:%v\n", selfPid, reply.MapId, reply.Filename)
+			return reply, true
 		}
 
 		if reply.MapId == -1 {
 			// no more unassigned works to do
-			return &reply, false
+			return reply, false
 		}
 
 		if reply.MapId == -2 {
-			LogPrintf("Wait for task re-assignment due to incomplete map phase.")
+			LogPrintf("Wait for task re-assignment due to incomplete map phase.\n")
 			time.Sleep(time.Second)
 			continue
 		}
@@ -85,9 +86,6 @@ func getMapTask() (*MapResponse, bool) {
 		// UNREACHABLE
 		log.Fatalf("Got invalid mapId: %v\n", reply.MapId)
 	}
-
-	LogPrintf("Worker %v got map work %v:%v\n", selfPid, reply.MapId, reply.Filename)
-	return &reply, true
 }
 
 func executeMap(mapf func(string, string) []KeyValue, filename string) []KeyValue {
@@ -177,11 +175,12 @@ func mapWrapper(mapf func(string, string) []KeyValue) {
 func getReduceTask() (*ReduceResponse, bool) {
 	selfPid := os.Getpid()
 	args := TaskRequest{WorkerId: selfPid}
-	reply := ReduceResponse{}
+	reply := new(ReduceResponse)
 
 	for {
+		*reply = ReduceResponse{}
 		LogPrintf("Worker %v RPC GetReduceTask.\n", args.WorkerId)
-		ok := call("Coordinator.GetReduceTask", &args, &reply)
+		ok := call("Coordinator.GetReduceTask", &args, reply)
 		if !ok {
 			log.Fatalln("RPC call failed in getReduceTask")
 		}
@@ -189,23 +188,25 @@ func getReduceTask() (*ReduceResponse, bool) {
 		idChecker(selfPid, reply.WorkerId)
 
 		if reply.ReduceId >= 0 {
-			break
+			LogPrintf("Worker %v got reduce work %v, files: %v\n", selfPid,
+				reply.ReduceId, reply.FilenameCsv)
+			return reply, true
 		}
 
 		if reply.ReduceId == -1 {
 			// no more unassigned works to do
-			return &reply, false
+			return reply, false
 		}
 
 		if reply.ReduceId == -2 {
 			// the coordinator is not ready yet to assign any reduce tasks
-			LogPrintf("The coordinator is not ready yet, wait...")
+			LogPrintf("The coordinator is not ready yet, wait...\n")
 			time.Sleep(time.Millisecond * time.Duration(100))
 			continue
 		}
 
 		if reply.ReduceId == -3 {
-			LogPrintf("Wait for task re-assignment due to incomplete reduce phase.")
+			LogPrintf("Wait for task re-assignment due to incomplete reduce phase.\n")
 			time.Sleep(time.Second)
 			continue
 		}
@@ -213,10 +214,6 @@ func getReduceTask() (*ReduceResponse, bool) {
 		// UNREACHABLE
 		log.Fatalf("Got invalid reduceId: %v\n", reply.ReduceId)
 	}
-
-	LogPrintf("Worker %v got reduce work %v, files: %v\n", selfPid,
-		reply.ReduceId, reply.FilenameCsv)
-	return &reply, true
 }
 
 func decodeMapResult(fname string) []KeyValue {
@@ -321,9 +318,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	mapWrapper(mapf)
 
 	reduceWrapper(reducef)
-
-	// todo:
-	// The overall principle is workers are the proactive ones to communicate with the coordinator.
 }
 
 // example function to show how to make an RPC call to the coordinator.
