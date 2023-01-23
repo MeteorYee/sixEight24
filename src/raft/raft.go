@@ -23,6 +23,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,27 +66,50 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
+	// index   int
+	Term    int
+	Command interface{}
+}
+
+func intmin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	cond      *sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	routineId uint32
+	routineId        uint32
+	heartbeatCounter uint32
+	lastHeartbeatId  uint32
 
 	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+	logs        []LogEntry
+	// todo: add crc check?
+
+	// the max index the peer thinks it's been committed, may be lower that leader's counterpart.
+	// commitIndex must be lower than the length of the logs
+	commitIndex int
+	lastApplied int
+
+	// makes sense for the leader only
+	nextIndex  []int
+	matchIndex []int
 
 	role      RaftRole
 	hasPinged bool
+
+	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) logf(rid uint32, format string, a ...interface{}) {
@@ -229,7 +253,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.hasPinged = true
 	if args.Term < rf.currentTerm {
 		rf.logf(rid, "Got an old-term request in RequestVote, req term = %v, "+
 			"current term = %v\n", args.Term, rf.currentTerm)
@@ -246,9 +269,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
 	}
-	// todo: add log entry comparision...
-	reply.VoteGranted = rf.votedFor == args.CandidateId
+
 	reply.Term = rf.currentTerm
+
+	lastIndex := len(rf.logs) - 1
+	if args.CandidateId == rf.votedFor {
+		reply.VoteGranted = args.LastLogTerm > rf.logs[lastIndex].Term ||
+			(args.LastLogTerm == rf.logs[lastIndex].Term && args.LastLogIndex >= lastIndex)
+	}
+	if !rf.hasPinged {
+		// we only think we're pinged by others when we successfully voted for somebody
+		rf.hasPinged = reply.VoteGranted
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -312,8 +344,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	index = len(rf.logs)
+	term = rf.currentTerm
+	isLeader = rf.role == RAFT_LEADER
+	if isLeader {
+		rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+		// FIXME:
+		// In theory, we should not update the self matchIndex here, but as we don't need to
+		// implement log persistence in 2B, we pretend the log entry is persisted when we receive
+		// it. However, we need to remove this once we're realizing the log persistence.
+		rf.matchIndex[rf.me] = index
+	}
+	rf.mu.Unlock()
 
+	if isLeader {
+		rf.logf(0, "Client start call on leader, index = %v, term = %v, cmd = %v\n",
+			index, term, command)
+	}
 	return index, term, isLeader
 }
 
@@ -391,9 +439,17 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 	if term != rf.currentTerm {
 		// some higher term server has already claimed the leadership
 		rf.assertf(rid, rf.currentTerm > term, "There couldn't be a lower term in claimLeadership.\n")
+		rf.logf(rid, "%v failed to claim the leadership due to finding out a higher term\n", rf.me)
 	} else {
 		rf.role = RAFT_LEADER
 		hasBecomeLeader = true
+		// reset the index arrays
+		npeers := len(rf.peers)
+		for i := 0; i < npeers; i++ {
+			rf.nextIndex[i] = len(rf.logs)
+			// todo: might need change the value if we're doing async log flush in the future
+			rf.matchIndex[i] = len(rf.logs) - 1
+		}
 	}
 	rf.mu.Unlock()
 
@@ -404,8 +460,24 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 }
 
 func (rf *Raft) sendVoteRoutine(rid uint32, peer int, term int, ch chan VoteChannelMsg) {
-	// todo: revise LastLogIndex and LastLogTerm
-	args := RequestVoteArgs{Rid: rid, Term: term, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
+	rf.mu.Lock()
+	lastIndex := len(rf.logs) - 1
+	lastTerm := rf.logs[lastIndex].Term
+	curTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	if curTerm != term {
+		rf.logf(rid, "Found term unmatched before sending vote request.\n")
+		ch <- VoteChannelMsg{abortElection: true, voteGranted: false}
+		return
+	}
+
+	args := RequestVoteArgs{
+		Rid:          rid,
+		Term:         term,
+		CandidateId:  rf.me,
+		LastLogIndex: lastIndex,
+		LastLogTerm:  lastTerm}
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(peer, &args, &reply)
 	if !ok {
@@ -508,16 +580,63 @@ type AppendEntryReply struct {
 
 	Term    int
 	Success bool
+
+	// info used for skipping unneccessary append entry RPCs
+	PrevTerm  int // the previous term of the conflicting term if it applies
+	LastIndex int // the last index of the previous term if it applies
+}
+
+// ASSERT:
+// 1. this function should be protected by rf.mu
+// 2. index < len(rf.logs)
+func (rf *Raft) binSearchPrevTerm(rid uint32, term int, index int) (prevTerm int, lastIndex int) {
+	rf.assertf(rid, index != 0, "binSearchPrevTerm index must not be zero\n")
+	prevTerm = 0
+	lastIndex = 0
+	left := 0
+	right := index
+	var mid int
+
+	for left <= right {
+		mid = left + (right-left)/2
+		if rf.logs[mid].Term != rf.logs[mid+1].Term {
+			if rf.logs[mid+1].Term == term {
+				prevTerm = rf.logs[mid].Term
+				lastIndex = mid
+				return
+			}
+			rf.assertf(rid, rf.logs[mid+1].Term < term, "binSearchPrevTerm term out of order, "+
+				"term not eaqual, mid entry: %v, mid+1 entry: %v\n", rf.logs[mid], rf.logs[mid+1])
+			left = mid + 1
+		} else if rf.logs[mid].Term == term {
+			right = mid - 1
+		} else {
+			rf.assertf(rid, rf.logs[mid].Term < term, "binSearchPrevTerm term out of order, "+
+				"term equal, mid entry: %v\n", rf.logs[mid])
+			left = mid + 1
+		}
+	}
+
+	// cuz we have a placeholder at index 0, the function must be able to find a way out by
+	// going through the above logic
+	rf.assertf(rid, false, "binSearchPrevTerm UNREACHABLE\n")
+	return
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rid := args.Rid
 	reply.Rid = args.Rid
 	reply.Success = false
+	notifyApplier := false
 	rf.logf(rid, "Receive AppendEntries request from %v.\n", args.LeaderId)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		rf.mu.Unlock()
+		if notifyApplier {
+			rf.cond.Signal()
+		}
+	}()
 
 	rf.hasPinged = true
 	if args.Term < rf.currentTerm {
@@ -534,55 +653,96 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	reply.Term = rf.currentTerm
-	if len(args.Entries) == 0 {
-		// skip heartbeat messages
-		reply.Success = true
+	loglen := len(rf.logs)
+	if args.PrevLogIndex >= loglen {
+		rf.logf(rid, "The follower has not got enough log entries as the leader expected.\n")
+		reply.PrevTerm = rf.logs[loglen-1].Term
+		reply.LastIndex = loglen - 1
 		return
 	}
-	// todo: play with the log entries and commit index...
+
+	entry := &rf.logs[args.PrevLogIndex]
+	if entry.Term != args.PrevLogTerm {
+		rf.logf(rid, "The follower has found conflicting term, entryTerm = %v\n", entry.Term)
+		reply.PrevTerm, reply.LastIndex = rf.binSearchPrevTerm(rid, entry.Term, args.PrevLogIndex)
+		rf.logs = rf.logs[:reply.LastIndex+1]  // delete the following conflicting logs
+		rf.matchIndex[rf.me] = reply.LastIndex // don't forget the matchIndex!, todo: async flush
+		return
+	}
+
+	if len(args.Entries) > 0 {
+		// we cannot append directly, there may be logs overlapped
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		rf.matchIndex[rf.me] = len(rf.logs) - 1 // todo: might adjust to async flush later on
+	}
+	if args.LeaderCommitIndex > rf.commitIndex {
+		rf.logf(rid, "AppendEntry succeeded, commitIndex before: %v, leader's one: %v, len(log): %v\n",
+			rf.commitIndex, args.LeaderCommitIndex, len(rf.logs))
+		rf.commitIndex = intmin(args.LeaderCommitIndex, len(rf.logs)-1)
+		notifyApplier = rf.commitIndex > rf.lastApplied
+	}
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 	rid := args.Rid
 	rf.logf(rid, "Begin sendAppendEntries to %v, term = %v, leader = %v, prevLogIndex = %v, "+
-		"prevLogTerm = %v, leaderCommit = %v\n", server, args.Term, args.LeaderId, args.PrevLogIndex,
-		args.PrevLogTerm, args.LeaderCommitIndex)
+		"prevLogTerm = %v, leaderCommit = %v, len(logEntries) = %v\n", server, args.Term,
+		args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommitIndex, len(args.Entries))
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
 	if ok {
-		rf.logf(rid, "End sendAppendEntries from %v, term = %v, success = %v\n", server,
-			reply.Term, reply.Success)
+		rf.logf(rid, "End sendAppendEntries from %v, term = %v, success = %v, prevTerm = %v, "+
+			"lastIndex = %v\n", server, reply.Term, reply.Success, reply.PrevTerm, reply.LastIndex)
 		rf.assertf(rid, rid == reply.Rid, "The Rid in args and reply must match. reply.Rid = %v\n",
 			reply.Rid)
 	}
 	return ok
 }
 
-func (rf *Raft) checkLeadership(rid uint32, term int) bool {
+func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs) bool {
+	args.Entries = make([]LogEntry, 0)
+	args.PrevLogIndex = 0
+	args.PrevLogTerm = 0
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if term != rf.currentTerm {
-		// some higher term server has already claimed the leadership
-		rf.assertf(rid, rf.currentTerm > term, "There couldn't be a lower term in checkLeadership.\n")
-		rf.logf(rid, "%v found out it's no longer the leader before sending out heartbeats. "+
-			"current term = %v\n", rf.me, rf.currentTerm)
+	if args.Term != rf.currentTerm {
+		rf.assertf(rid, rf.currentTerm > args.Term,
+			"There couldn't be a lower term when constructing AppendEntryMsg.\n")
+		rf.logf(rid, "Term unmatched when constructing AppendEntryMsg"+
+			", argsTerm = %v, currentTerm = %v\n", args.Term, rf.currentTerm)
 		return false
 	}
 
-	rf.assertf(rid, rf.role == RAFT_LEADER && rf.votedFor == rf.me,
-		"The leader must be me at term %v\n", term)
+	args.LeaderCommitIndex = rf.commitIndex
+	nextIndex := rf.nextIndex[peer]
+	loglen := len(rf.logs)
+
+	if nextIndex != loglen {
+		rf.assertf(rid, nextIndex < loglen,
+			"The nextIndex = %v couldn't be greater than len(rf.logs) = %v\n", nextIndex, loglen)
+		// todo: if the number of entries is too big, we might need to split them
+		rf.logf(rid, "Leader appends entries, nextIndex = %v, loglen = %v\n", nextIndex, loglen)
+		args.Entries = append(args.Entries, rf.logs[nextIndex:]...)
+	}
+	args.PrevLogIndex = nextIndex - 1
+	args.PrevLogTerm = rf.logs[nextIndex-1].Term
+
 	return true
 }
 
-func (rf *Raft) appendEntryRoutine(rid uint32, peer int, term int, ch chan bool) {
+func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, ch chan bool) {
 	// todo: modify the rest of the parameters
-	args := AppendEntryArgs{Rid: rid, Term: term, LeaderId: rf.me,
-		Entries: make([]LogEntry, 0)}
+	args := AppendEntryArgs{Rid: rid, Term: term, LeaderId: rf.me}
 	reply := AppendEntryReply{}
-	timeBeforeCall := time.Now()
+	if !rf.constructAppEntryMsg(rid, peer, &args) {
+		ch <- false
+		return
+	}
 
+	timeBeforeCall := time.Now()
 	ok := rf.sendAppendEntries(peer, &args, &reply)
 	if time.Since(timeBeforeCall).Milliseconds() > HEARTBEAT_TIME_OUT {
 		rf.logf(rid, "heartbeat reply from %v arrives too late, drop it\n", peer)
@@ -606,25 +766,95 @@ func (rf *Raft) appendEntryRoutine(rid uint32, peer int, term int, ch chan bool)
 		return
 	}
 
-	// todo: handle reply.Success
+	// FIXME: might need to extract a function
+	rf.mu.Lock()
+	if hbid < rf.lastHeartbeatId {
+		rf.logf(rid, "heartbeat id (%v) is less than the latest one (%v), drop the reply\n",
+			hbid, rf.lastHeartbeatId)
+		rf.mu.Unlock()
+		return
+	}
+	rf.lastHeartbeatId = hbid
+
+	if reply.Success {
+		rf.nextIndex[peer] += len(args.Entries)
+		// todo: need a field in the reply when we have servers restarted, cuz log might not be all
+		// loaded from storage, so we need to retry. Or we can use some hack values of LastIndex to
+		// indicate that.
+		rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+	} else {
+		// todo:
+		// 1. we can do another binary search here to check if the replied term is correct
+		//    (yet another speedup for AppendEntries)
+		// 2. might need another field in the reply to record the info if doing async flush
+		rf.nextIndex[peer] = reply.LastIndex + 1
+		// we can only decide what the matchedIndex is when we find where the peer's log matches for us
+		rf.matchIndex[peer] = 0
+	}
+	rf.mu.Unlock()
 	ch <- true
+}
+
+func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
+	npeers := len(rf.peers)
+	matcharr := make([]int, npeers)
+	notifyApplier := false
+
+	rf.mu.Lock()
+	defer func() {
+		rf.mu.Unlock()
+		if notifyApplier {
+			rf.cond.Signal()
+		}
+	}()
+
+	if term != rf.currentTerm {
+		// some higher term server has already claimed the leadership
+		rf.assertf(rid, rf.currentTerm > term, "There couldn't be a lower term in refreshLeaderInfo.\n")
+		rf.logf(rid, "%v found out it's no longer the leader before sending out heartbeats. "+
+			"current term = %v\n", rf.me, rf.currentTerm)
+		return rf.commitIndex, false
+	}
+
+	rf.assertf(rid, rf.role == RAFT_LEADER && rf.votedFor == rf.me,
+		"The leader must be me at term %v\n", term)
+
+	copiedLen := copy(matcharr, rf.matchIndex)
+	rf.assertf(rid, copiedLen == npeers, "Length does not match when copying the matchIndex array.\n")
+
+	sort.Slice(matcharr, func(i, j int) bool {
+		return matcharr[i] > matcharr[j] // descending order
+	})
+
+	// get the value that is equal to or less than the majority's match index
+	commitIndex := matcharr[npeers/2]
+	if commitIndex > rf.commitIndex && rf.logs[commitIndex].Term == term {
+		rf.logf(rid, "leader change commitIndex from %v to %v, term: %v\n",
+			rf.commitIndex, commitIndex, term)
+		rf.commitIndex = commitIndex
+		notifyApplier = rf.commitIndex > rf.lastApplied
+	}
+	return rf.commitIndex, true
 }
 
 func (rf *Raft) heartbeats(rid uint32, term int) {
 	ch := make(chan bool, len(rf.peers)-1)
 
 	for !rf.killed() {
-		if !rf.checkLeadership(rid, term) {
+		commitIndex, isLeader := rf.refreshLeaderInfo(rid, term)
+		if !isLeader {
 			// I am no longer the leader, it's time to bail
 			return
 		}
 
+		rf.logf(rid, "Term %v, commitIndex = %v, leader heartbeats...\n", term, commitIndex)
+		heartbeatId := atomic.AddUint32(&rf.heartbeatCounter, 1)
 		for peer := 0; peer < len(rf.peers); peer++ {
 			if peer == rf.me {
 				continue
 			}
 
-			go rf.appendEntryRoutine(atomic.AddUint32(&rf.routineId, 1), peer, term, ch)
+			go rf.appendEntryRoutine(atomic.AddUint32(&rf.routineId, 1), heartbeatId, peer, term, ch)
 		}
 
 		timer := time.After(time.Duration(HEARTBEAT_TIME_OUT) * time.Millisecond)
@@ -639,6 +869,44 @@ func (rf *Raft) heartbeats(rid uint32, term int) {
 				keepWait = false
 			}
 		}
+	}
+}
+
+func (rf *Raft) getNextApplyInfo() (cmdIndex int, commitIndex int, nextCommand interface{}) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for rf.commitIndex <= rf.lastApplied {
+		rf.cond.Wait()
+	}
+
+	commitIndex = rf.commitIndex
+	nextCommand = nil
+	// ASSERT
+	// 1. commitIndex < len(rf.logs);
+	// 2. commitIndex > rf.lastApplied
+	rf.lastApplied++
+	cmdIndex = rf.lastApplied
+	nextCommand = rf.logs[cmdIndex].Command
+	return
+}
+
+func (rf *Raft) applyRoutine(rid uint32) {
+	// todo: for 2D,
+	// SnapshotValid bool
+	// Snapshot      []byte
+	// SnapshotTerm  int
+	// SnapshotIndex int
+
+	for !rf.killed() {
+		cmdIndex, commitIndex, nextCommand := rf.getNextApplyInfo()
+		rf.assertf(rid, nextCommand != nil,
+			"The command must not be nil when we have something to apply\n")
+
+		rf.logf(rid, "Applier got next apply info, cmdIndex = %v, commitIndex = %v, command = %v\n",
+			cmdIndex, commitIndex, nextCommand)
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: nextCommand,
+			CommandIndex: cmdIndex, SnapshotValid: false}
 	}
 }
 
@@ -658,15 +926,34 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.cond = sync.NewCond(&rf.mu)
+
 	rf.routineId = uint32(me) << 16
+	rf.heartbeatCounter = 0
+	rf.lastHeartbeatId = 0
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]LogEntry, 0)
+	// We reserve index 0 to prevent boundary checking if clauses.
+	rf.logs = make([]LogEntry, 1)
+	rf.logs[0] = LogEntry{Term: 0, Command: nil}
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	npeers := len(peers)
+	rf.nextIndex = make([]int, npeers)
+	rf.matchIndex = make([]int, npeers)
+	for i := 0; i < npeers; i++ {
+		rf.nextIndex[i] = 1
+		rf.matchIndex[i] = 0
+	}
 
 	rf.role = RAFT_FOLLOWER
 	rf.hasPinged = false
+
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -675,6 +962,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 
 	go rf.ticker(atomic.AddUint32(&rf.routineId, 1))
+
+	go rf.applyRoutine(atomic.AddUint32(&rf.routineId, 1))
 
 	return rf
 }
