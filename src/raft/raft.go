@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -29,12 +30,13 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
 const HEARTBEAT_TIME_OUT = 100
-const ELECTION_TIME_OUT_LO = 500
-const ELECTION_TIME_OUT_HI = 800
+const ELECTION_TIME_OUT_LO = 300
+const ELECTION_TIME_OUT_HI = 600
 
 type RaftRole int
 
@@ -66,7 +68,6 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	// index   int
 	Term    int
 	Command interface{}
 }
@@ -80,27 +81,28 @@ func intmin(a, b int) int {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex // Lock to protect shared access to this peer's state
-	cond      *sync.Cond
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu          sync.Mutex // Lock to protect shared access to this peer's state
+	applyCond   *sync.Cond
+	persistCond *sync.Cond
+	peers       []*labrpc.ClientEnd // RPC end points of all peers
+	persister   *Persister          // Object to hold this peer's persisted state
+	me          int                 // this peer's index into peers[]
+	dead        int32               // set by Kill()
 
 	routineId        uint32
 	heartbeatCounter uint32
 	lastHeartbeatId  uint32
 
-	// Your data here (2A, 2B, 2C).
+	// Persistent State
+	// FIXME: need CRC check if we're writing to the real disk
 	currentTerm int
 	votedFor    int
 	logs        []LogEntry
-	// todo: add crc check?
 
-	// the max index the peer thinks it's been committed, may be lower that leader's counterpart.
-	// commitIndex must be lower than the length of the logs
+	// the max index the peer thinks it's been committed, may be lower that leader's counterpart,
+	// and it must be lower than the length of the logs
 	commitIndex int
-	lastApplied int
+	lastApplied int // the last index applied to the upper application
 
 	// makes sense for the leader only
 	nextIndex  []int
@@ -109,12 +111,13 @@ type Raft struct {
 	role      RaftRole
 	hasPinged bool
 
+	enableLog bool
+
 	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) logf(rid uint32, format string, a ...interface{}) {
-	_, logTurnedOn := os.LookupEnv("LOG_VERBOSE_M6824")
-	if !logTurnedOn {
+	if !rf.enableLog {
 		return
 	}
 	str := fmt.Sprintf(format, a...)
@@ -168,35 +171,63 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+func (rf *Raft) persist(rid uint32) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	rf.mu.Lock()
+
+	// NOTE: There is no need to persist the log indexed at zero as the entry there is just a
+	// placeholder. One might argue we then wouldn't be able to persist the `currentTerm` and
+	// the `votedFor` had they changed without any logs appended. Granted that, they could be
+	// volatile before there are any log entries persisted on storage, because they would always
+	// re-establish a new consensus if any or all of them failed and re-joined the cluster. The
+	// values of `currentTerm` and `votedFor` can start from scratch as they got no side effects
+	// if there are no logs at all.
+	maxIndex := len(rf.logs) - 1
+	selfMatchIndex := rf.matchIndex[rf.me]
+	for selfMatchIndex >= maxIndex {
+		// No need to persist anything
+		rf.persistCond.Wait()
+		maxIndex = len(rf.logs) - 1
+		selfMatchIndex = rf.matchIndex[rf.me]
+	}
+
+	rf.matchIndex[rf.me] = maxIndex
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+
+	rf.persister.SaveRaftState(w.Bytes())
+	rf.mu.Unlock()
+	rf.logf(rid, "Persist succeeded, self match index modified from %v to %v\n",
+		selfMatchIndex, maxIndex)
 }
 
 // restore previously persisted state.
+// CAVEAT: this function must be called before any goroutines set off, so this is why there are no
+// mutex protections.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	err := d.Decode(&rf.currentTerm)
+	if err != nil {
+		rf.assertf(0, false, "Failed to read currentTerm from persister, errmsg: %v", err)
+	}
+	err = d.Decode(&rf.votedFor)
+	if err != nil {
+		rf.assertf(0, false, "Failed to read votedFor from persister, errmsg: %v", err)
+	}
+	err = d.Decode(&rf.logs)
+	if err != nil {
+		rf.assertf(0, false, "Failed to read logs from persister, errmsg: %v", err)
+	}
+
+	rf.matchIndex[rf.me] = len(rf.logs) - 1
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -350,17 +381,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.role == RAFT_LEADER
 	if isLeader {
 		rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
-		// FIXME:
-		// In theory, we should not update the self matchIndex here, but as we don't need to
-		// implement log persistence in 2B, we pretend the log entry is persisted when we receive
-		// it. However, we need to remove this once we're realizing the log persistence.
-		rf.matchIndex[rf.me] = index
 	}
 	rf.mu.Unlock()
 
 	if isLeader {
 		rf.logf(0, "Client start call on leader, index = %v, term = %v, cmd = %v\n",
 			index, term, command)
+		rf.persistCond.Signal()
 	}
 	return index, term, isLeader
 }
@@ -447,8 +474,10 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 		npeers := len(rf.peers)
 		for i := 0; i < npeers; i++ {
 			rf.nextIndex[i] = len(rf.logs)
-			// todo: might need change the value if we're doing async log flush in the future
-			rf.matchIndex[i] = len(rf.logs) - 1
+			if i != rf.me {
+				// we don't know how many log entries have the other peers persisted for now
+				rf.matchIndex[i] = 0
+			}
 		}
 	}
 	rf.mu.Unlock()
@@ -582,8 +611,11 @@ type AppendEntryReply struct {
 	Success bool
 
 	// info used for skipping unneccessary append entry RPCs
-	PrevTerm  int // the previous term of the conflicting term if it applies
-	LastIndex int // the last index of the previous term if it applies
+	// ``PrevTerm'' means the previous term of the conflicting term if it applies
+	// ``MagicIndex'' means the last index of the previous term if the AppendEntry RPC fails, or
+	// the local matchIndex if it succeeds
+	PrevTerm   int
+	MagicIndex int
 }
 
 // ASSERT:
@@ -634,7 +666,11 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	defer func() {
 		rf.mu.Unlock()
 		if notifyApplier {
-			rf.cond.Signal()
+			rf.applyCond.Signal()
+		}
+
+		if reply.Success && len(args.Entries) > 0 {
+			rf.persistCond.Signal()
 		}
 	}()
 
@@ -654,34 +690,36 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	reply.Term = rf.currentTerm
 	loglen := len(rf.logs)
-	if args.PrevLogIndex >= loglen {
+	leaderPrevIndex := args.PrevLogIndex
+	if leaderPrevIndex >= loglen {
 		rf.logf(rid, "The follower has not got enough log entries as the leader expected.\n")
 		reply.PrevTerm = rf.logs[loglen-1].Term
-		reply.LastIndex = loglen - 1
+		reply.MagicIndex = loglen - 1
 		return
 	}
 
-	entry := &rf.logs[args.PrevLogIndex]
+	entry := &rf.logs[leaderPrevIndex]
 	if entry.Term != args.PrevLogTerm {
 		rf.logf(rid, "The follower has found conflicting term, entryTerm = %v\n", entry.Term)
-		reply.PrevTerm, reply.LastIndex = rf.binSearchPrevTerm(rid, entry.Term, args.PrevLogIndex)
-		rf.logs = rf.logs[:reply.LastIndex+1]  // delete the following conflicting logs
-		rf.matchIndex[rf.me] = reply.LastIndex // don't forget the matchIndex!, todo: async flush
+		reply.PrevTerm, reply.MagicIndex = rf.binSearchPrevTerm(rid, entry.Term, leaderPrevIndex)
+		rf.logs = rf.logs[:reply.MagicIndex+1] // delete the following conflicting logs
 		return
 	}
 
 	if len(args.Entries) > 0 {
-		// we cannot append directly, there may be logs overlapped
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-		rf.matchIndex[rf.me] = len(rf.logs) - 1 // todo: might adjust to async flush later on
-	}
-	if args.LeaderCommitIndex > rf.commitIndex {
+		// we cannot append the entries directly, there may be overlapped ones
+		rf.logs = append(rf.logs[:leaderPrevIndex+1], args.Entries...)
+		rf.matchIndex[rf.me] = intmin(rf.matchIndex[rf.me], leaderPrevIndex)
 		rf.logf(rid, "AppendEntry succeeded, commitIndex before: %v, leader's one: %v, len(log): %v\n",
 			rf.commitIndex, args.LeaderCommitIndex, len(rf.logs))
+	}
+	if args.LeaderCommitIndex > rf.commitIndex {
 		rf.commitIndex = intmin(args.LeaderCommitIndex, len(rf.logs)-1)
 		notifyApplier = rf.commitIndex > rf.lastApplied
 	}
 	reply.Success = true
+	reply.PrevTerm = 0
+	reply.MagicIndex = rf.matchIndex[rf.me]
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
@@ -694,7 +732,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *Appe
 
 	if ok {
 		rf.logf(rid, "End sendAppendEntries from %v, term = %v, success = %v, prevTerm = %v, "+
-			"lastIndex = %v\n", server, reply.Term, reply.Success, reply.PrevTerm, reply.LastIndex)
+			"magicIndex = %v\n", server, reply.Term, reply.Success, reply.PrevTerm, reply.MagicIndex)
 		rf.assertf(rid, rid == reply.Rid, "The Rid in args and reply must match. reply.Rid = %v\n",
 			reply.Rid)
 	}
@@ -734,7 +772,6 @@ func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs
 }
 
 func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, ch chan bool) {
-	// todo: modify the rest of the parameters
 	args := AppendEntryArgs{Rid: rid, Term: term, LeaderId: rf.me}
 	reply := AppendEntryReply{}
 	if !rf.constructAppEntryMsg(rid, peer, &args) {
@@ -778,18 +815,17 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 
 	if reply.Success {
 		rf.nextIndex[peer] += len(args.Entries)
-		// todo: need a field in the reply when we have servers restarted, cuz log might not be all
-		// loaded from storage, so we need to retry. Or we can use some hack values of LastIndex to
-		// indicate that.
-		rf.matchIndex[peer] = rf.nextIndex[peer] - 1
-	} else {
-		// todo:
-		// 1. we can do another binary search here to check if the replied term is correct
-		//    (yet another speedup for AppendEntries)
-		// 2. might need another field in the reply to record the info if doing async flush
-		rf.nextIndex[peer] = reply.LastIndex + 1
 		// we can only decide what the matchedIndex is when we find where the peer's log matches for us
-		rf.matchIndex[peer] = 0
+		rf.matchIndex[peer] = reply.MagicIndex
+	} else {
+		peerPrevIndex := reply.MagicIndex
+		if rf.logs[peerPrevIndex].Term != reply.PrevTerm {
+			// still not the same, we can do another binary search at leader side
+			_, lastIndex := rf.binSearchPrevTerm(rid, rf.logs[peerPrevIndex].Term, peerPrevIndex)
+			rf.nextIndex[peer] = lastIndex + 1
+		} else {
+			rf.nextIndex[peer] = peerPrevIndex + 1
+		}
 	}
 	rf.mu.Unlock()
 	ch <- true
@@ -804,7 +840,7 @@ func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
 	defer func() {
 		rf.mu.Unlock()
 		if notifyApplier {
-			rf.cond.Signal()
+			rf.applyCond.Signal()
 		}
 	}()
 
@@ -832,21 +868,26 @@ func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
 		rf.logf(rid, "leader change commitIndex from %v to %v, term: %v\n",
 			rf.commitIndex, commitIndex, term)
 		rf.commitIndex = commitIndex
-		notifyApplier = rf.commitIndex > rf.lastApplied
 	}
+	// A SPEEDUP
+	// Although the Raft paper requires the commitIndex be modified only when it's the leader's
+	// current term, we can conclude that the log at a certain index must be committed, without
+	// regard to the term, if all the peers have their logs pass over the index. This trick is
+	// indicated in section 5.4 of the paper.
+	if matcharr[npeers-1] > rf.commitIndex {
+		rf.logf(rid, "The min match index > commitIndex, change from %v to %v, term: %v\n",
+			rf.commitIndex, commitIndex, term)
+		rf.commitIndex = matcharr[npeers-1]
+	}
+	notifyApplier = rf.commitIndex > rf.lastApplied
 	return rf.commitIndex, true
 }
 
 func (rf *Raft) heartbeats(rid uint32, term int) {
 	ch := make(chan bool, len(rf.peers)-1)
 
-	for !rf.killed() {
-		commitIndex, isLeader := rf.refreshLeaderInfo(rid, term)
-		if !isLeader {
-			// I am no longer the leader, it's time to bail
-			return
-		}
-
+	commitIndex, isLeader := rf.refreshLeaderInfo(rid, term)
+	for !rf.killed() && isLeader {
 		rf.logf(rid, "Term %v, commitIndex = %v, leader heartbeats...\n", term, commitIndex)
 		heartbeatId := atomic.AddUint32(&rf.heartbeatCounter, 1)
 		for peer := 0; peer < len(rf.peers); peer++ {
@@ -865,6 +906,9 @@ func (rf *Raft) heartbeats(rid uint32, term int) {
 				if !ok {
 					return
 				}
+				commitIndex, isLeader = rf.refreshLeaderInfo(rid, term)
+				// if it's still the leader, we keep waiting
+				keepWait = isLeader
 			case <-timer:
 				keepWait = false
 			}
@@ -877,7 +921,7 @@ func (rf *Raft) getNextApplyInfo() (cmdIndex int, commitIndex int, nextCommand i
 	defer rf.mu.Unlock()
 
 	for rf.commitIndex <= rf.lastApplied {
-		rf.cond.Wait()
+		rf.applyCond.Wait()
 	}
 
 	commitIndex = rf.commitIndex
@@ -910,6 +954,12 @@ func (rf *Raft) applyRoutine(rid uint32) {
 	}
 }
 
+func (rf *Raft) persistRoutine(rid uint32) {
+	for !rf.killed() {
+		rf.persist(rid)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -926,24 +976,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.persistCond = sync.NewCond(&rf.mu)
 
 	rf.routineId = uint32(me) << 16
 	rf.heartbeatCounter = 0
 	rf.lastHeartbeatId = 0
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	// We reserve index 0 to prevent boundary checking if clauses.
-	rf.logs = make([]LogEntry, 1)
-	rf.logs[0] = LogEntry{Term: 0, Command: nil}
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
 	npeers := len(peers)
 	rf.nextIndex = make([]int, npeers)
+	// NOTE: rf.matchIndex[rf.me] makes sense on all servers, which means the max index replicated
+	// on the local server
 	rf.matchIndex = make([]int, npeers)
 	for i := 0; i < npeers; i++ {
 		rf.nextIndex[i] = 1
@@ -953,17 +999,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = RAFT_FOLLOWER
 	rf.hasPinged = false
 
+	_, rf.enableLog = os.LookupEnv("LOG_VERBOSE_M6824")
+
 	rf.applyCh = applyCh
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	prevRaftState := persister.ReadRaftState()
+	if len(prevRaftState) > 0 {
+		// initialize from state persisted before a crash
+		rf.readPersist(prevRaftState)
+	} else {
+		// start from scratch
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		// We reserve index 0 to prevent boundary checking if clauses.
+		rf.logs = make([]LogEntry, 1)
+		rf.logs[0] = LogEntry{Term: 0, Command: nil}
+	}
 
 	rand.Seed(time.Now().UnixNano())
-	// start ticker goroutine to start elections
 
+	// start ticker goroutine to start elections
 	go rf.ticker(atomic.AddUint32(&rf.routineId, 1))
 
 	go rf.applyRoutine(atomic.AddUint32(&rf.routineId, 1))
+
+	go rf.persistRoutine(atomic.AddUint32(&rf.routineId, 1))
 
 	return rf
 }
