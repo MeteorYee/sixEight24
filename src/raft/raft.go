@@ -68,6 +68,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
+	Index   int
 	Term    int
 	Command interface{}
 }
@@ -99,8 +100,8 @@ type Raft struct {
 	votedFor    int
 	logs        []LogEntry
 
-	// the max index the peer thinks it's been committed, may be lower that leader's counterpart,
-	// and it must be lower than the length of the logs
+	// the max index the peer thinks it's been committed, may be less than leader's counterpart,
+	// and it must be less than the length of the logs
 	commitIndex int
 	lastApplied int // the last index applied to the upper application
 
@@ -132,6 +133,34 @@ func (rf *Raft) assertf(rid uint32, assertion bool, format string, a ...interfac
 	str := fmt.Sprintf(format, a...)
 	log.Fatalf("[%v][server=%v][rid=%v][FATAL]: "+str, time.Now().Format("01-02-2006 15:04:05.0000"),
 		rf.me, rid)
+}
+
+func (rf *Raft) lastSnapshot() *LogEntry {
+	return &rf.logs[0]
+}
+
+func (rf *Raft) getLogEntry(rid uint32, index int) *LogEntry {
+	lastSnapshotIndex := rf.lastSnapshot().Index
+	rf.assertf(rid, index >= lastSnapshotIndex, "Inconsistent index in LogEntry getter. "+
+		"index = %v, lastSnapshotIndex = %v\n", index, lastSnapshotIndex)
+	entry := &rf.logs[index-lastSnapshotIndex]
+	rf.assertf(rid, entry.Index == index, "Found unmatched log index: %v, passed in: %v\n",
+		entry.Index, index)
+	return entry
+}
+
+func (rf *Raft) lastLogEntry() *LogEntry {
+	return &rf.logs[len(rf.logs)-1]
+}
+
+// ASSERT: under rf.mu's protection
+// left close right open: [from, to)
+func (rf *Raft) getLogSlice(rid uint32, from int, to int) []LogEntry {
+	lastSnapshotIndex := rf.lastSnapshot().Index
+	rf.assertf(rid, from >= lastSnapshotIndex && to >= lastSnapshotIndex,
+		"Inconsistent parameter in log slicing, from = %v, to = %v, lastSnapshotIndex = %v\n",
+		from, to, lastSnapshotIndex)
+	return rf.logs[from-lastSnapshotIndex : to-lastSnapshotIndex]
 }
 
 func (rf *Raft) updateTerm(term int) {
@@ -184,13 +213,12 @@ func (rf *Raft) persist(rid uint32) {
 	// re-establish a new consensus if any or all of them failed and re-joined the cluster. The
 	// values of `currentTerm` and `votedFor` can start from scratch as they got no side effects
 	// if there are no logs at all.
-	maxIndex := len(rf.logs) - 1
+	maxIndex := rf.lastLogEntry().Index
 	selfMatchIndex := rf.matchIndex[rf.me]
-	for selfMatchIndex >= maxIndex {
+	for rf.matchIndex[rf.me] >= maxIndex {
 		// No need to persist anything
 		rf.persistCond.Wait()
-		maxIndex = len(rf.logs) - 1
-		selfMatchIndex = rf.matchIndex[rf.me]
+		maxIndex = rf.lastLogEntry().Index
 	}
 
 	rf.matchIndex[rf.me] = maxIndex
@@ -215,27 +243,49 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	err := d.Decode(&rf.currentTerm)
-	if err != nil {
-		rf.assertf(0, false, "Failed to read currentTerm from persister, errmsg: %v", err)
-	}
+	rf.assertf(0, err == nil, "Failed to read currentTerm from persister, errmsg: %v\n", err)
+
 	err = d.Decode(&rf.votedFor)
-	if err != nil {
-		rf.assertf(0, false, "Failed to read votedFor from persister, errmsg: %v", err)
-	}
+	rf.assertf(0, err == nil, "Failed to read votedFor from persister, errmsg: %v\n", err)
+
 	err = d.Decode(&rf.logs)
-	if err != nil {
-		rf.assertf(0, false, "Failed to read logs from persister, errmsg: %v", err)
+	rf.assertf(0, err == nil, "Failed to read logs from persister, errmsg: %v\n", err)
+
+	rf.matchIndex[rf.me] = rf.lastLogEntry().Index
+}
+
+// The caller should take care of the rf.mu protection.
+func (rf *Raft) readSnapshot(data []byte, retSnapshot bool) (
+	lastSnapshotIndex int, lastSnapshotTerm int, snapshot []byte) {
+
+	lastSnapshotIndex = 0
+	lastSnapshotTerm = 0
+	snapshot = nil
+	if data == nil || len(data) < 1 {
+		return
 	}
 
-	rf.matchIndex[rf.me] = len(rf.logs) - 1
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	err := d.Decode(&lastSnapshotIndex)
+	rf.assertf(0, err == nil, "Failed to read lastSnapshotIndex from persister, errmsg: %v\n", err)
+
+	err = d.Decode(&lastSnapshotTerm)
+	rf.assertf(0, err == nil, "Failed to read lastSnapshotTerm from persister, errmsg: %v\n", err)
+
+	if !retSnapshot {
+		return
+	}
+	err = d.Decode(&snapshot)
+	rf.assertf(0, err == nil, "Failed to read snapshot from persister, errmsg: %v\n", err)
+	return
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
+	// DEPRECATED as per the suggestion of the requirement of 2022's lab2D
 	return true
 }
 
@@ -245,7 +295,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	// TODO
 }
 
 // example RequestVote RPC arguments structure.
@@ -303,10 +353,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 
-	lastIndex := len(rf.logs) - 1
+	lastEntry := rf.lastLogEntry()
 	if args.CandidateId == rf.votedFor {
-		reply.VoteGranted = args.LastLogTerm > rf.logs[lastIndex].Term ||
-			(args.LastLogTerm == rf.logs[lastIndex].Term && args.LastLogIndex >= lastIndex)
+		reply.VoteGranted = args.LastLogTerm > lastEntry.Term ||
+			(args.LastLogTerm == lastEntry.Term && args.LastLogIndex >= lastEntry.Index)
 	}
 	if !rf.hasPinged {
 		// we only think we're pinged by others when we successfully voted for somebody
@@ -376,11 +426,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	rf.mu.Lock()
-	index = len(rf.logs)
+	index = rf.lastLogEntry().Index + 1
 	term = rf.currentTerm
 	isLeader = rf.role == RAFT_LEADER
 	if isLeader {
-		rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+		rf.logs = append(rf.logs, LogEntry{Index: index, Term: term, Command: command})
 	}
 	rf.mu.Unlock()
 
@@ -473,9 +523,9 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 		// reset the index arrays
 		npeers := len(rf.peers)
 		for i := 0; i < npeers; i++ {
-			rf.nextIndex[i] = len(rf.logs)
+			rf.nextIndex[i] = rf.lastLogEntry().Index + 1
 			if i != rf.me {
-				// we don't know how many log entries have the other peers persisted for now
+				// we don't know how many log entries the other peers have persisted for now
 				rf.matchIndex[i] = 0
 			}
 		}
@@ -490,8 +540,7 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 
 func (rf *Raft) sendVoteRoutine(rid uint32, peer int, term int, ch chan VoteChannelMsg) {
 	rf.mu.Lock()
-	lastIndex := len(rf.logs) - 1
-	lastTerm := rf.logs[lastIndex].Term
+	lastEntry := rf.lastLogEntry()
 	curTerm := rf.currentTerm
 	rf.mu.Unlock()
 
@@ -505,8 +554,8 @@ func (rf *Raft) sendVoteRoutine(rid uint32, peer int, term int, ch chan VoteChan
 		Rid:          rid,
 		Term:         term,
 		CandidateId:  rf.me,
-		LastLogIndex: lastIndex,
-		LastLogTerm:  lastTerm}
+		LastLogIndex: lastEntry.Index,
+		LastLogTerm:  lastEntry.Term}
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(peer, &args, &reply)
 	if !ok {
@@ -598,10 +647,12 @@ type AppendEntryArgs struct {
 	Term     int
 	LeaderId int
 
-	PrevLogIndex      int
-	PrevLogTerm       int
-	Entries           []LogEntry
-	LeaderCommitIndex int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+
+	LeaderCommitIndex   int
+	LeaderSnapshotIndex int
 }
 
 type AppendEntryReply struct {
@@ -620,13 +671,22 @@ type AppendEntryReply struct {
 
 // ASSERT:
 // 1. this function should be protected by rf.mu
-// 2. index < len(rf.logs)
+// 2. index > lastSnapshotIndex
+//
+// NOTE:
+// The passed-in `index` and the `lastIndex` to be returned are logical indices.
+// `lastSnapshotIndex` should be subtracted from them. The caller must make sure the
+// `lastSnapshotIndex` value should be consistent between two peers before calling
+// this method.
 func (rf *Raft) binSearchPrevTerm(rid uint32, term int, index int) (prevTerm int, lastIndex int) {
+	lastSnapshotIndex := rf.lastSnapshot().Index
 	rf.assertf(rid, index != 0, "binSearchPrevTerm index must not be zero\n")
+	rf.assertf(rid, index > lastSnapshotIndex, "Inconsistent index in binSearch. "+
+		"index = %v, lastSnapshotIndex = %v\n", index, lastSnapshotIndex)
 	prevTerm = 0
 	lastIndex = 0
 	left := 0
-	right := index
+	right := index - lastSnapshotIndex
 	var mid int
 
 	for left <= right {
@@ -634,7 +694,7 @@ func (rf *Raft) binSearchPrevTerm(rid uint32, term int, index int) (prevTerm int
 		if rf.logs[mid].Term != rf.logs[mid+1].Term {
 			if rf.logs[mid+1].Term == term {
 				prevTerm = rf.logs[mid].Term
-				lastIndex = mid
+				lastIndex = rf.logs[mid].Index
 				return
 			}
 			rf.assertf(rid, rf.logs[mid+1].Term < term, "binSearchPrevTerm term out of order, "+
@@ -688,33 +748,43 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.updateTerm(args.Term)
 	}
 
+	// TODO:
+	// 1. add snapshot index checking
+	// 2. wrap rf.matchIndex[rf.me] as getter/setter functions
+	lastSnapshotIndex := rf.lastSnapshot().Index
+	rf.assertf(rid, args.LeaderSnapshotIndex == lastSnapshotIndex, "always true for now!\n")
+
 	reply.Term = rf.currentTerm
-	loglen := len(rf.logs)
+	lastEntry := rf.lastLogEntry()
 	leaderPrevIndex := args.PrevLogIndex
-	if leaderPrevIndex >= loglen {
+	if leaderPrevIndex > lastEntry.Index {
 		rf.logf(rid, "The follower has not got enough log entries as the leader expected.\n")
-		reply.PrevTerm = rf.logs[loglen-1].Term
-		reply.MagicIndex = loglen - 1
+		reply.PrevTerm = lastEntry.Term
+		reply.MagicIndex = lastEntry.Index
 		return
 	}
 
-	entry := &rf.logs[leaderPrevIndex]
+	entry := rf.getLogEntry(rid, leaderPrevIndex)
 	if entry.Term != args.PrevLogTerm {
 		rf.logf(rid, "The follower has found conflicting term, entryTerm = %v\n", entry.Term)
 		reply.PrevTerm, reply.MagicIndex = rf.binSearchPrevTerm(rid, entry.Term, leaderPrevIndex)
-		rf.logs = rf.logs[:reply.MagicIndex+1] // delete the following conflicting logs
+		// delete the following conflicting logs
+		rf.logs = rf.getLogSlice(rid, lastSnapshotIndex, reply.MagicIndex+1)
+		rf.matchIndex[rf.me] = intmin(rf.matchIndex[rf.me], reply.MagicIndex)
 		return
 	}
 
 	if len(args.Entries) > 0 {
 		// we cannot append the entries directly, there may be overlapped ones
-		rf.logs = append(rf.logs[:leaderPrevIndex+1], args.Entries...)
+		rf.logs = append(
+			rf.getLogSlice(rid, lastSnapshotIndex, leaderPrevIndex+1), args.Entries...)
 		rf.matchIndex[rf.me] = intmin(rf.matchIndex[rf.me], leaderPrevIndex)
-		rf.logf(rid, "AppendEntry succeeded, commitIndex before: %v, leader's one: %v, len(log): %v\n",
-			rf.commitIndex, args.LeaderCommitIndex, len(rf.logs))
+		rf.logf(rid, "AppendEntry succeeded, commitIndex before: %v, leader's one: %v, len(log): %v"+
+			", lastSnapshotIndex = %v\n", rf.commitIndex, args.LeaderCommitIndex, len(rf.logs),
+			lastSnapshotIndex)
 	}
 	if args.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = intmin(args.LeaderCommitIndex, len(rf.logs)-1)
+		rf.commitIndex = intmin(args.LeaderCommitIndex, rf.matchIndex[rf.me])
 		notifyApplier = rf.commitIndex > rf.lastApplied
 	}
 	reply.Success = true
@@ -754,20 +824,28 @@ func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs
 		return false
 	}
 
-	args.LeaderCommitIndex = rf.commitIndex
 	nextIndex := rf.nextIndex[peer]
+	lastEntry := rf.lastLogEntry()
 	loglen := len(rf.logs)
+	lastSnapshotIndex := rf.lastSnapshot().Index
 
-	if nextIndex != loglen {
-		rf.assertf(rid, nextIndex < loglen,
-			"The nextIndex = %v couldn't be greater than len(rf.logs) = %v\n", nextIndex, loglen)
+	if nextIndex != lastEntry.Index+1 {
+		rf.assertf(rid, nextIndex <= lastEntry.Index,
+			"The nextIndex = %v couldn't be greater than the last index = %v, "+
+				"log length = %v, lastSnapshotIndex = %v\n",
+			nextIndex, lastEntry.Index, loglen, lastSnapshotIndex)
 		// todo: if the number of entries is too big, we might need to split them
-		rf.logf(rid, "Leader appends entries, nextIndex = %v, loglen = %v\n", nextIndex, loglen)
-		args.Entries = append(args.Entries, rf.logs[nextIndex:]...)
+		rf.logf(rid, "Leader appends entries, nextIndex = %v, last index = %v"+
+			"log length = %v, lastSnapshotIndex = %v\n",
+			nextIndex, lastEntry.Index, loglen, lastSnapshotIndex)
+		args.Entries = rf.getLogSlice(rid, nextIndex, loglen)
 	}
-	args.PrevLogIndex = nextIndex - 1
-	args.PrevLogTerm = rf.logs[nextIndex-1].Term
 
+	prevEntry := rf.getLogEntry(rid, nextIndex-1)
+	args.PrevLogIndex = prevEntry.Index
+	args.PrevLogTerm = prevEntry.Term
+	args.LeaderCommitIndex = rf.commitIndex
+	args.LeaderSnapshotIndex = lastSnapshotIndex
 	return true
 }
 
@@ -815,13 +893,15 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 
 	if reply.Success {
 		rf.nextIndex[peer] += len(args.Entries)
-		// we can only decide what the matchedIndex is when we find where the peer's log matches for us
+		// we can only decide what the matchedIndex is when we find where the peer's log
+		// matches for us
 		rf.matchIndex[peer] = reply.MagicIndex
 	} else {
 		peerPrevIndex := reply.MagicIndex
-		if rf.logs[peerPrevIndex].Term != reply.PrevTerm {
+		localPrevTerm := rf.getLogEntry(rid, peerPrevIndex).Term
+		if localPrevTerm != reply.PrevTerm {
 			// still not the same, we can do another binary search at leader side
-			_, lastIndex := rf.binSearchPrevTerm(rid, rf.logs[peerPrevIndex].Term, peerPrevIndex)
+			_, lastIndex := rf.binSearchPrevTerm(rid, localPrevTerm, peerPrevIndex)
 			rf.nextIndex[peer] = lastIndex + 1
 		} else {
 			rf.nextIndex[peer] = peerPrevIndex + 1
@@ -864,15 +944,15 @@ func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
 
 	// get the value that is equal to or less than the majority's match index
 	commitIndex := matcharr[npeers/2]
-	if commitIndex > rf.commitIndex && rf.logs[commitIndex].Term == term {
+	if commitIndex > rf.commitIndex && rf.getLogEntry(rid, commitIndex).Term == term {
 		rf.logf(rid, "leader change commitIndex from %v to %v, term: %v\n",
 			rf.commitIndex, commitIndex, term)
 		rf.commitIndex = commitIndex
 	}
 	// A SPEEDUP
 	// Although the Raft paper requires the commitIndex be modified only when it's the leader's
-	// current term, we can conclude that the log at a certain index must be committed, without
-	// regard to the term, if all the peers have their logs pass over the index. This trick is
+	// current term, we can conclude that the log at a certain index must be committed without
+	// regard to the term, if all the peers have their logs passed over the index. The trick is
 	// indicated in section 5.4 of the paper.
 	if matcharr[npeers-1] > rf.commitIndex {
 		rf.logf(rid, "The min match index > commitIndex, change from %v to %v, term: %v\n",
@@ -916,7 +996,9 @@ func (rf *Raft) heartbeats(rid uint32, term int) {
 	}
 }
 
-func (rf *Raft) getNextApplyInfo() (cmdIndex int, commitIndex int, nextCommand interface{}) {
+func (rf *Raft) getNextApplyInfo(rid uint32) (cmdIndex int, commitIndex int,
+	nextCommand interface{}) {
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -927,11 +1009,12 @@ func (rf *Raft) getNextApplyInfo() (cmdIndex int, commitIndex int, nextCommand i
 	commitIndex = rf.commitIndex
 	nextCommand = nil
 	// ASSERT
-	// 1. commitIndex < len(rf.logs);
+	// 1. commitIndex <= lastEntry.Index;
 	// 2. commitIndex > rf.lastApplied
 	rf.lastApplied++
 	cmdIndex = rf.lastApplied
-	nextCommand = rf.logs[cmdIndex].Command
+	nextCommand = rf.getLogEntry(rid, cmdIndex).Command
+	// TODO: ADD ASSERT ON entry.Index == lastApplied
 	return
 }
 
@@ -943,7 +1026,7 @@ func (rf *Raft) applyRoutine(rid uint32) {
 	// SnapshotIndex int
 
 	for !rf.killed() {
-		cmdIndex, commitIndex, nextCommand := rf.getNextApplyInfo()
+		cmdIndex, commitIndex, nextCommand := rf.getNextApplyInfo(rid)
 		rf.assertf(rid, nextCommand != nil,
 			"The command must not be nil when we have something to apply\n")
 
@@ -1003,18 +1086,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 
-	prevRaftState := persister.ReadRaftState()
-	if len(prevRaftState) > 0 {
+	if persister.RaftStateSize() > 0 {
 		// initialize from state persisted before a crash
-		rf.readPersist(prevRaftState)
+		rf.readPersist(persister.ReadRaftState())
 	} else {
 		// start from scratch
 		rf.currentTerm = 0
 		rf.votedFor = -1
-		// We reserve index 0 to prevent boundary checking if clauses.
+		// We reserve index 0 to prevent boundary checking when doing binary search. What's more,
+		// we use the log entry as our special `lastSnapshot` entry.
 		rf.logs = make([]LogEntry, 1)
-		rf.logs[0] = LogEntry{Term: 0, Command: nil}
+		rf.logs[0] = LogEntry{Index: 0, Term: 0, Command: nil}
 	}
+
+	lastSnapshot := rf.lastSnapshot()
+	lastSnapshot.Index, lastSnapshot.Term, _ = rf.readSnapshot(persister.ReadSnapshot(), false)
 
 	rand.Seed(time.Now().UnixNano())
 
