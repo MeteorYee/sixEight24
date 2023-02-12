@@ -172,14 +172,13 @@ func (rf *Raft) updateTerm(term int) {
 	rf.role = RAFT_FOLLOWER
 }
 
-func (rf *Raft) refreshTerm(term int) int {
+func (rf *Raft) refreshTerm(term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.currentTerm < term {
 		rf.updateTerm(term)
 	}
-	return rf.currentTerm
 }
 
 // return currentTerm and whether this server
@@ -871,24 +870,34 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 		return
 	}
 
-	if reply.Term != term {
-		rf.assertf(rid, reply.Term > term, "There couldn't be a lower term in the reply.\n")
-		rf.logf(rid, "heartbeats: %v found out it's no longer the leader when checking "+
-			"reply's term = %v.\n", rf.me, reply.Term)
-		rf.refreshTerm(reply.Term)
-		// term has changed, we give up sending more heartbeats
-		ch <- false
-		return
-	}
-
 	// FIXME: might need to extract a function
 	rf.mu.Lock()
 	if hbid < rf.lastHeartbeatId {
+		// We use heartbeats id to skip a potential old reply even if there are inconsistent terms.
 		rf.logf(rid, "heartbeat id (%v) is less than the latest one (%v), drop the reply\n",
 			hbid, rf.lastHeartbeatId)
 		rf.mu.Unlock()
 		return
 	}
+
+	if reply.Term != term || term != rf.currentTerm {
+		rf.logf(rid, "Heartbeats aborted. It's no longer the leader current term = %v "+
+			"reply's term = %v, hb term = %v.\n", rf.currentTerm, reply.Term, term)
+		if reply.Term != term {
+			rf.assertf(rid, reply.Term > term, "There couldn't be a lower term in the hb reply.\n")
+		} else {
+			rf.assertf(rid, rf.currentTerm > term,
+				"The currentTerm couldn't be less than the hb term.\n")
+		}
+		if rf.currentTerm < reply.Term {
+			rf.updateTerm(reply.Term)
+		}
+		rf.mu.Unlock()
+		// term has changed, we give up sending more heartbeats
+		ch <- false
+		return
+	}
+
 	rf.lastHeartbeatId = hbid
 
 	if reply.Success {
