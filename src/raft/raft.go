@@ -521,18 +521,24 @@ func (rf *Raft) claimLeadership(rid uint32, term int) {
 		hasBecomeLeader = true
 		// reset the index arrays
 		npeers := len(rf.peers)
+		lastLogIndex := rf.lastLogEntry().Index
 		for i := 0; i < npeers; i++ {
-			rf.nextIndex[i] = rf.lastLogEntry().Index + 1
-			if i != rf.me {
-				// we don't know how many log entries the other peers have persisted for now
-				rf.matchIndex[i] = 0
-			}
+			rf.nextIndex[i] = lastLogIndex + 1
+			// We don't know how many log entries the other peers have persisted for now. What's
+			// more, there could be inconsistencies between the self match index and the current
+			// number of logs in memory as well. To illustrate, this may happen when a previous
+			// leader had already asked us to trim some of the logs in memory but didn't manage to
+			// finish the whole log synchronization process. Then we make it to claim the leadership
+			// and thus need to sync the value of self match index with the current logs. Therefore,
+			// this is why we are notifying the persisting routine below.
+			rf.matchIndex[i] = 0
 		}
 	}
 	rf.mu.Unlock()
 
 	if hasBecomeLeader {
 		rf.logf(rid, "%v has become the leader and starts to send out heartbeats\n", rf.me)
+		rf.persistCond.Signal()
 		go rf.heartbeats(atomic.AddUint32(&rf.routineId, 1), term)
 	}
 }
@@ -769,7 +775,6 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.PrevTerm, reply.MagicIndex = rf.binSearchPrevTerm(rid, entry.Term, leaderPrevIndex)
 		// delete the following conflicting logs
 		rf.logs = rf.getLogSlice(rid, lastSnapshotIndex, reply.MagicIndex+1)
-		rf.matchIndex[rf.me] = intmin(rf.matchIndex[rf.me], reply.MagicIndex)
 		return
 	}
 
