@@ -263,35 +263,6 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.updatePersistedIndex(rf.lastLogEntry().Index)
 }
 
-// The caller should take care of the rf.mu protection.
-func (rf *Raft) readSnapshot(retSnapshot bool) (
-	lastSnapshotIndex int, lastSnapshotTerm int, snapshot []byte) {
-
-	data := rf.persister.ReadSnapshot()
-	lastSnapshotIndex = 0
-	lastSnapshotTerm = 0
-	snapshot = nil
-	if data == nil || len(data) < 1 {
-		return
-	}
-
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-
-	err := d.Decode(&lastSnapshotIndex)
-	rf.assertf(0, err == nil, "Failed to read lastSnapshotIndex from persister, errmsg: %v\n", err)
-
-	err = d.Decode(&lastSnapshotTerm)
-	rf.assertf(0, err == nil, "Failed to read lastSnapshotTerm from persister, errmsg: %v\n", err)
-
-	if !retSnapshot {
-		return
-	}
-	err = d.Decode(&snapshot)
-	rf.assertf(0, err == nil, "Failed to read snapshot from persister, errmsg: %v\n", err)
-	return
-}
-
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
@@ -1131,7 +1102,7 @@ type SendSnapshotReply struct {
 	Success bool
 }
 
-func (rf *Raft) ReceiveSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply) {
+func (rf *Raft) InstallSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply) {
 	rid := args.Rid
 	reply.Rid = rid
 	reply.Success = false
@@ -1150,16 +1121,16 @@ func (rf *Raft) ReceiveSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply
 		return
 	}
 
-	snapshot := rf.lastSnapshot()
-	if args.SnapshotIndex <= snapshot.Index {
+	localSnapshot := rf.lastSnapshot()
+	if args.SnapshotIndex <= localSnapshot.Index {
 		rf.logf(0, "Skip receving snapshot, the requested index: %v <= lastSnapshot: %v\n",
-			args.SnapshotIndex, snapshot.Index)
+			args.SnapshotIndex, localSnapshot.Index)
 		return
 	}
 
 	// update the snapshot index
-	snapshot.Index = args.SnapshotIndex
-	snapshot.Term = args.SnapshotTerm
+	localSnapshot.Index = args.SnapshotIndex
+	localSnapshot.Term = args.SnapshotTerm
 	maxIndex := rf.lastLogEntry().Index
 	if maxIndex > args.SnapshotIndex {
 		rf.logs = append(rf.logs[:1], rf.getLogSlice(0, args.SnapshotIndex+1, maxIndex+1)...)
@@ -1183,8 +1154,8 @@ func (rf *Raft) ReceiveSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply
 
 func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
 	// TODO:
-	// 1. CHECK the snapshot rpc logic, using the paper's hint and the lab hint
-	// 2. test test test!
+	// 1. RUN with race
+	// 2. test test test
 
 	args := SendSnapshotArgs{Rid: rid, LeaderId: rf.me}
 	reply := SendSnapshotReply{}
@@ -1200,19 +1171,17 @@ func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
 		return
 	}
 	args.Term = curTerm
-	args.SnapshotIndex, args.SnapshotTerm, args.Data = rf.readSnapshot(true)
+	args.Data = rf.persister.ReadSnapshot()
 	snapshot := *rf.lastSnapshot()
 
 	rf.mu.Unlock()
 
-	rf.assertf(rid, snapshot.Index == args.SnapshotIndex, "Snapshot Inconsistent: index in memory"+
-		": %v, index in persister: %v\n", snapshot.Index, args.SnapshotIndex)
-	rf.assertf(rid, snapshot.Term == args.SnapshotTerm, "Snapshot Inconsistent: term in memory"+
-		": %v, term in persister: %v\n", snapshot.Term, args.SnapshotTerm)
+	args.SnapshotIndex = snapshot.Index
+	args.SnapshotTerm = snapshot.Term
 
 	rf.logf(rid, "Send snapshot enter: CurrentTerm: %v, SIndex: %v, STerm: %v\n",
 		args.Term, args.SnapshotIndex, args.SnapshotTerm)
-	ok := rf.peers[peer].Call("Raft.ReceiveSnapshot", &args, &reply)
+	ok := rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
 	if !ok {
 		rf.logf(rid, "Send snapshot to %v failed.\n", peer)
 		return
@@ -1273,6 +1242,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 
+	// note that the last snapshot index and term are hidden in logs[0]
 	if persister.RaftStateSize() > 0 {
 		// initialize from state persisted before a crash
 		rf.readPersist(persister.ReadRaftState())
@@ -1285,9 +1255,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.logs = make([]LogEntry, 1)
 		rf.logs[0] = LogEntry{Index: 0, Term: 0, Command: nil}
 	}
-
-	lastSnapshot := rf.lastSnapshot()
-	lastSnapshot.Index, lastSnapshot.Term, _ = rf.readSnapshot(false)
 
 	rand.Seed(time.Now().UnixNano())
 
