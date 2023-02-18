@@ -60,7 +60,6 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
-	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
@@ -141,11 +140,13 @@ func (rf *Raft) lastSnapshot() *LogEntry {
 
 func (rf *Raft) getLogEntry(rid uint32, index int) *LogEntry {
 	lastSnapshotIndex := rf.lastSnapshot().Index
+	maxIndex := rf.lastLogEntry().Index
+	rf.assertf(rid, index <= maxIndex, "index(%v) > maxIndex(%v)\n", index, maxIndex)
 	rf.assertf(rid, index >= lastSnapshotIndex, "Inconsistent index in LogEntry getter. "+
 		"index = %v, lastSnapshotIndex = %v\n", index, lastSnapshotIndex)
 	entry := &rf.logs[index-lastSnapshotIndex]
-	rf.assertf(rid, entry.Index == index, "Found unmatched log index: %v, passed in: %v\n",
-		entry.Index, index)
+	rf.assertf(rid, entry.Index == index, "Found unmatched log index: %v, passed in: %v, "+
+		"lastSnapshotIndex = %v\n", entry.Index, index, lastSnapshotIndex)
 	return entry
 }
 
@@ -159,16 +160,20 @@ func (rf *Raft) persistedIndex() int {
 }
 
 // ASSERT: protected by rf.mu
-func (rf *Raft) updatePersistedIndex(index int) {
+func (rf *Raft) setPersistedIndex(index int) {
 	rf.matchIndex[rf.me] = index
 }
 
 // ASSERT: under rf.mu's protection
 // left close right open: [from, to)
-func (rf *Raft) getLogSlice(rid uint32, from int, to int) []LogEntry {
+func (rf *Raft) logSlice(rid uint32, from int, to int) []LogEntry {
 	lastSnapshotIndex := rf.lastSnapshot().Index
+	logicalLen := rf.lastLogEntry().Index + 1
+	rf.assertf(rid, from <= to, "from(%v) >= to(%v)\n", from, to)
+	rf.assertf(rid, from <= logicalLen, "from(%v) >= len(%v)\n", from, logicalLen)
+	rf.assertf(rid, to <= logicalLen, "to(%v) > len(%v)\n", to, logicalLen)
 	rf.assertf(rid, from >= lastSnapshotIndex && to >= lastSnapshotIndex,
-		"Inconsistent parameter in log slicing, from = %v, to = %v, lastSnapshotIndex = %v\n",
+		"Invalid parameter in log slicing, from = %v, to = %v, lastSnapshotIndex = %v\n",
 		from, to, lastSnapshotIndex)
 	return rf.logs[from-lastSnapshotIndex : to-lastSnapshotIndex]
 }
@@ -230,7 +235,7 @@ func (rf *Raft) persist(rid uint32) {
 		maxIndex = rf.lastLogEntry().Index
 	}
 
-	rf.updatePersistedIndex(maxIndex)
+	rf.setPersistedIndex(maxIndex)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
@@ -260,7 +265,7 @@ func (rf *Raft) readPersist(data []byte) {
 	err = d.Decode(&rf.logs)
 	rf.assertf(0, err == nil, "Failed to read logs from persister, errmsg: %v\n", err)
 
-	rf.updatePersistedIndex(rf.lastLogEntry().Index)
+	rf.setPersistedIndex(rf.lastLogEntry().Index)
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -283,8 +288,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	lastSnapshotIndex := lastSnapshot.Index
 	// In theory, the upper level users know no more indices greater than the local committed index.
 	// However, the Raft leader may or may not observe to this constraint under the hood.
-	rf.assertf(0, index <= rf.commitIndex, "Invalid snapshot index: %v, commitIndex: %v, "+
-		"lastSnapshot: %v\n", index, rf.commitIndex, lastSnapshotIndex)
+	rf.assertf(0, index <= rf.lastApplied, "Invalid snapshot index: %v, lastAppliedIndex: %v, "+
+		"lastSnapshot: %v\n", index, rf.lastApplied, lastSnapshotIndex)
 
 	if index <= lastSnapshotIndex {
 		rf.mu.Unlock()
@@ -294,15 +299,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	// update the snapshot index
+	maxIndex := rf.lastLogEntry().Index
+	rf.logs = append(rf.logs[:1], rf.logSlice(0, index+1, maxIndex+1)...)
 	lastSnapshot.Index = index
 	lastSnapshot.Term = rf.currentTerm
-	maxIndex := rf.lastLogEntry().Index
-	rf.logs = append(rf.logs[:1], rf.getLogSlice(0, index+1, maxIndex+1)...)
 
 	lastPersistedIndex := rf.persistedIndex()
 	if lastPersistedIndex < maxIndex {
 		// update the persisted index
-		rf.updatePersistedIndex(maxIndex)
+		rf.setPersistedIndex(maxIndex)
 	}
 
 	e.Encode(rf.currentTerm)
@@ -775,6 +780,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.updateTerm(args.Term)
 	}
 
+	reply.Term = rf.currentTerm
 	lastSnapshotIndex := rf.lastSnapshot().Index
 	if args.LeaderSnapshotIndex != lastSnapshotIndex {
 		rf.logf(rid, "The follower has got an inconsistent snapshot. leader: %v, self: %v\n",
@@ -783,7 +789,6 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
-	reply.Term = rf.currentTerm
 	lastEntry := rf.lastLogEntry()
 	leaderPrevIndex := args.PrevLogIndex
 	if leaderPrevIndex > lastEntry.Index {
@@ -798,22 +803,21 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.logf(rid, "The follower has found conflicting term, entryTerm = %v\n", entry.Term)
 		reply.PrevTerm, reply.MagicIndex = rf.binSearchPrevTerm(rid, entry.Term, leaderPrevIndex)
 		// delete the following conflicting logs
-		rf.logs = rf.getLogSlice(rid, lastSnapshotIndex, reply.MagicIndex+1)
+		rf.logs = rf.logSlice(rid, lastSnapshotIndex, reply.MagicIndex+1)
 		return
 	}
 
 	if len(args.Entries) > 0 {
 		// we cannot append the entries directly, there may be overlapped ones
-		rf.logs = append(
-			rf.getLogSlice(rid, lastSnapshotIndex, leaderPrevIndex+1), args.Entries...)
-		rf.updatePersistedIndex(intmin(rf.persistedIndex(), leaderPrevIndex))
-		rf.logf(rid, "AppendEntry succeeded, commitIndex before: %v, leader's one: %v, len(log): %v"+
-			", lastSnapshotIndex = %v\n", rf.commitIndex, args.LeaderCommitIndex, len(rf.logs),
-			lastSnapshotIndex)
+		rf.logs = append(rf.logSlice(rid, lastSnapshotIndex, leaderPrevIndex+1), args.Entries...)
+		rf.setPersistedIndex(intmin(rf.persistedIndex(), leaderPrevIndex))
+		rf.logf(rid, "AppendEntry succeeded, peer commit idx: %v, leader's one: %v, last idx: %v"+
+			", lastSnapshotIndex = %v\n", rf.commitIndex, args.LeaderCommitIndex,
+			rf.lastLogEntry().Index, lastSnapshotIndex)
 	}
 	if args.LeaderCommitIndex > rf.commitIndex {
 		rf.commitIndex = intmin(args.LeaderCommitIndex, rf.persistedIndex())
-		notifyApplier = rf.commitIndex > rf.lastApplied
+		notifyApplier = rf.commitIndex > rf.lastApplied && rf.commitIndex >= lastSnapshotIndex
 	}
 	reply.Success = true
 	reply.PrevTerm = 0
@@ -830,17 +834,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *Appe
 
 	if ok {
 		rf.logf(rid, "End sendAppendEntries from %v, term = %v, success = %v, prevTerm = %v, "+
-			"magicIndex = %v\n", server, reply.Term, reply.Success, reply.PrevTerm, reply.MagicIndex)
+			"magicIndex = %v, need snapshot: %v\n", server, reply.Term, reply.Success,
+			reply.PrevTerm, reply.MagicIndex, reply.NeedSnapshot)
 		rf.assertf(rid, rid == reply.Rid, "The Rid in args and reply must match. reply.Rid = %v\n",
 			reply.Rid)
 	}
 	return ok
 }
 
-func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs) bool {
+func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs) (isLeader bool,
+	needSnapshot bool) {
+
 	args.Entries = make([]LogEntry, 0)
 	args.PrevLogIndex = 0
 	args.PrevLogTerm = 0
+	isLeader = true
+	needSnapshot = false
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -849,24 +859,29 @@ func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs
 			"There couldn't be a lower term when constructing AppendEntryMsg.\n")
 		rf.logf(rid, "Term unmatched when constructing AppendEntryMsg"+
 			", argsTerm = %v, currentTerm = %v\n", args.Term, rf.currentTerm)
-		return false
+		isLeader = false
+		return
 	}
 
 	nextIndex := rf.nextIndex[peer]
 	lastEntry := rf.lastLogEntry()
-	loglen := len(rf.logs)
 	lastSnapshotIndex := rf.lastSnapshot().Index
+
+	if nextIndex <= lastSnapshotIndex {
+		// we can just send the snapshot directly
+		needSnapshot = true
+		rf.nextIndex[peer] = lastSnapshotIndex + 1
+		nextIndex = lastSnapshotIndex + 1
+	}
 
 	if nextIndex != lastEntry.Index+1 {
 		rf.assertf(rid, nextIndex <= lastEntry.Index,
 			"The nextIndex = %v couldn't be greater than the last index = %v, "+
-				"log length = %v, lastSnapshotIndex = %v\n",
-			nextIndex, lastEntry.Index, loglen, lastSnapshotIndex)
+				"lastSnapshotIndex = %v\n", nextIndex, lastEntry.Index, lastSnapshotIndex)
 		// todo: if the number of entries is too big, we might need to split them
-		rf.logf(rid, "Leader appends entries, nextIndex = %v, last index = %v"+
-			"log length = %v, lastSnapshotIndex = %v\n",
-			nextIndex, lastEntry.Index, loglen, lastSnapshotIndex)
-		args.Entries = rf.getLogSlice(rid, nextIndex, loglen)
+		rf.logf(rid, "Leader appends entries, nextIndex = %v, last index = %v, "+
+			"lastSnapshotIndex = %v\n", nextIndex, lastEntry.Index, lastSnapshotIndex)
+		args.Entries = rf.logSlice(rid, nextIndex, lastEntry.Index+1)
 	}
 
 	prevEntry := rf.getLogEntry(rid, nextIndex-1)
@@ -874,32 +889,12 @@ func (rf *Raft) constructAppEntryMsg(rid uint32, peer int, args *AppendEntryArgs
 	args.PrevLogTerm = prevEntry.Term
 	args.LeaderCommitIndex = rf.commitIndex
 	args.LeaderSnapshotIndex = lastSnapshotIndex
-	return true
+	return
 }
 
-func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, ch chan bool) {
-	args := AppendEntryArgs{Rid: rid, Term: term, LeaderId: rf.me}
-	reply := AppendEntryReply{}
-	if !rf.constructAppEntryMsg(rid, peer, &args) {
-		ch <- false
-		return
-	}
+func (rf *Raft) handleHeartbeatReply(rid uint32, hbid uint32, peer int, term int, ch chan bool,
+	args *AppendEntryArgs, reply *AppendEntryReply) {
 
-	timeBeforeCall := time.Now()
-	ok := rf.sendAppendEntries(peer, &args, &reply)
-	if time.Since(timeBeforeCall).Milliseconds() > HEARTBEAT_TIME_OUT {
-		rf.logf(rid, "heartbeat reply from %v arrives too late, drop it\n", peer)
-		return
-	}
-
-	if !ok {
-		rf.logf(rid, "%v's sendAppendEntries to %v has failed.\n", rf.me, peer)
-		// Although the rpc failed this time, we still don't give it up.
-		ch <- true
-		return
-	}
-
-	// FIXME: might need to extract a function
 	rf.mu.Lock()
 	if hbid < rf.lastHeartbeatId {
 		// We use heartbeats id to skip a potential old reply even if there are inconsistent terms.
@@ -909,6 +904,7 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 		return
 	}
 
+	rf.lastHeartbeatId = hbid
 	if reply.Term != term || term != rf.currentTerm {
 		rf.logf(rid, "Heartbeats aborted. It's no longer the leader current term = %v "+
 			"reply's term = %v, hb term = %v.\n", rf.currentTerm, reply.Term, term)
@@ -927,14 +923,21 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 		return
 	}
 
-	rf.lastHeartbeatId = hbid
+	curSnapshotIdx := rf.lastSnapshot().Index
+	if args.LeaderSnapshotIndex != curSnapshotIdx {
+		rf.assertf(rid, args.LeaderSnapshotIndex < curSnapshotIdx, "snapshot index out of"+
+			" order, the one in args: %v, current one: %v\n", args.LeaderSnapshotIndex,
+			curSnapshotIdx)
+		// the snapshot has been updated when we're doing the RPC, we need to send the new one
+		reply.NeedSnapshot = true
+	}
 
 	if reply.Success {
 		rf.nextIndex[peer] += len(args.Entries)
 		// we can only decide what the matchedIndex is when we find where the peer's log
 		// matches for us
 		rf.matchIndex[peer] = reply.MagicIndex
-	} else {
+	} else if !reply.NeedSnapshot {
 		peerPrevIndex := reply.MagicIndex
 		localPrevTerm := rf.getLogEntry(rid, peerPrevIndex).Term
 		if localPrevTerm != reply.PrevTerm {
@@ -951,6 +954,39 @@ func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, 
 	if reply.NeedSnapshot {
 		go rf.sendSnapshot(atomic.AddUint32(&rf.routineId, 1), peer, term)
 	}
+}
+
+func (rf *Raft) appendEntryRoutine(rid uint32, hbid uint32, peer int, term int, ch chan bool) {
+	args := AppendEntryArgs{Rid: rid, Term: term, LeaderId: rf.me}
+	reply := AppendEntryReply{}
+	ok := true
+
+	isLeader, needSnapshot := rf.constructAppEntryMsg(rid, peer, &args)
+	if needSnapshot {
+		rf.assertf(rid, isLeader, "when needSnapshot=true, we must be the leader.\n")
+		// we send the snapshot directly and then go on the heartbeat ping
+		isLeader, ok = rf.sendSnapshot(rid, peer, term)
+	}
+	if !isLeader || !ok {
+		ch <- isLeader
+		return
+	}
+
+	timeBeforeCall := time.Now()
+	ok = rf.sendAppendEntries(peer, &args, &reply)
+	if time.Since(timeBeforeCall).Milliseconds() > HEARTBEAT_TIME_OUT {
+		rf.logf(rid, "heartbeat reply from %v arrives too late, drop it\n", peer)
+		return
+	}
+
+	if !ok {
+		rf.logf(rid, "%v's sendAppendEntries to %v has failed.\n", rf.me, peer)
+		// Although the rpc failed this time, we still don't give it up.
+		ch <- true
+		return
+	}
+
+	rf.handleHeartbeatReply(rid, hbid, peer, term, ch, &args, &reply)
 }
 
 func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
@@ -1001,7 +1037,7 @@ func (rf *Raft) refreshLeaderInfo(rid uint32, term int) (int, bool) {
 			rf.commitIndex, commitIndex, term)
 		rf.commitIndex = matcharr[npeers-1]
 	}
-	notifyApplier = rf.commitIndex > rf.lastApplied
+	notifyApplier = rf.commitIndex > rf.lastApplied && rf.commitIndex >= rf.lastSnapshot().Index
 	return rf.commitIndex, true
 }
 
@@ -1038,46 +1074,52 @@ func (rf *Raft) heartbeats(rid uint32, term int) {
 	}
 }
 
-func (rf *Raft) getNextApplyInfo(rid uint32) (cmdIndex int, commitIndex int,
-	nextCommand interface{}) {
-
+func (rf *Raft) getNextApplyInfo(rid uint32, msg *ApplyMsg) (commitIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for rf.commitIndex <= rf.lastApplied {
+	for rf.commitIndex <= rf.lastApplied || rf.commitIndex < rf.lastSnapshot().Index {
 		rf.applyCond.Wait()
 	}
 
+	*msg = ApplyMsg{} // zero out the msg
+	snapshot := rf.lastSnapshot()
 	commitIndex = rf.commitIndex
-	nextCommand = nil
+	if rf.lastApplied < snapshot.Index {
+		msg.SnapshotValid = true
+		msg.Snapshot = rf.persister.ReadSnapshot()
+		msg.SnapshotTerm = snapshot.Term
+		msg.SnapshotIndex = snapshot.Index
+		rf.lastApplied = snapshot.Index
+		return
+	}
+
 	// ASSERT
 	// 1. commitIndex <= lastEntry.Index;
 	// 2. commitIndex > rf.lastApplied
 	rf.lastApplied++
-	cmdIndex = rf.lastApplied
-	entry := rf.getLogEntry(rid, cmdIndex)
-	nextCommand = entry.Command
-	rf.assertf(rid, entry.Index == cmdIndex, "Found inconsistent index in Applier. "+
-		"entry's index: %v, cmdIndex: %v\n", entry.Index, cmdIndex)
+	msg.CommandIndex = rf.lastApplied
+	entry := rf.getLogEntry(rid, msg.CommandIndex)
+	msg.Command = entry.Command
+	rf.assertf(rid, entry.Index == msg.CommandIndex, "Found inconsistent index in Applier. "+
+		"entry's index: %v, cmdIndex: %v\n", entry.Index, msg.CommandIndex)
+	msg.CommandValid = true
 	return
 }
 
 func (rf *Raft) applyRoutine(rid uint32) {
-	// todo: for 2D,
-	// SnapshotValid bool
-	// Snapshot      []byte
-	// SnapshotTerm  int
-	// SnapshotIndex int
-
 	for !rf.killed() {
-		cmdIndex, commitIndex, nextCommand := rf.getNextApplyInfo(rid)
-		rf.assertf(rid, nextCommand != nil,
-			"The command must not be nil when we have something to apply\n")
-
-		rf.logf(rid, "Applier got next apply info, cmdIndex = %v, commitIndex = %v, command = %v\n",
-			cmdIndex, commitIndex, nextCommand)
-		rf.applyCh <- ApplyMsg{CommandValid: true, Command: nextCommand,
-			CommandIndex: cmdIndex, SnapshotValid: false}
+		msg := ApplyMsg{}
+		commitIndex := rf.getNextApplyInfo(rid, &msg)
+		if msg.SnapshotValid {
+			rf.logf(rid, "Applying snapshot: idx:%v, term:%v\n", msg.SnapshotIndex, msg.SnapshotTerm)
+		} else {
+			rf.assertf(rid, msg.Command != nil,
+				"The command must not be nil when we have something to apply\n")
+			rf.logf(rid, "Applier got next apply info, cmdIndex = %v, commitIndex = %v, command = %v\n",
+				msg.CommandIndex, commitIndex, msg.Command)
+		}
+		rf.applyCh <- msg
 	}
 }
 
@@ -1111,13 +1153,21 @@ func (rf *Raft) InstallSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply
 	rid := args.Rid
 	reply.Rid = rid
 	reply.Success = false
+	notifyApplier := false
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		rf.mu.Unlock()
+		if notifyApplier {
+			rf.applyCond.Signal()
+		}
+	}()
 
+	rf.hasPinged = true
+	reply.Term = rf.currentTerm
 	if args.Term != rf.currentTerm {
 		rf.logf(rid, "Receive snapshot term %v unmatches the current term: %v\n",
 			args.Term, rf.currentTerm)
@@ -1128,25 +1178,31 @@ func (rf *Raft) InstallSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply
 
 	localSnapshot := rf.lastSnapshot()
 	if args.SnapshotIndex <= localSnapshot.Index {
-		rf.logf(0, "Skip receving snapshot, the requested index: %v <= lastSnapshot: %v\n",
+		rf.logf(rid, "Skip receiving snapshot, the requested index: %v <= lastSnapshot: %v\n",
 			args.SnapshotIndex, localSnapshot.Index)
 		return
 	}
 
 	// update the snapshot index
-	localSnapshot.Index = args.SnapshotIndex
-	localSnapshot.Term = args.SnapshotTerm
 	maxIndex := rf.lastLogEntry().Index
 	if maxIndex > args.SnapshotIndex {
-		rf.logs = append(rf.logs[:1], rf.getLogSlice(0, args.SnapshotIndex+1, maxIndex+1)...)
+		rf.logs = append(rf.logs[:1], rf.logSlice(0, args.SnapshotIndex+1, maxIndex+1)...)
 	} else {
 		rf.logs = rf.logs[:1]
 		maxIndex = args.SnapshotIndex
 	}
+	localSnapshot.Index = args.SnapshotIndex
+	localSnapshot.Term = args.SnapshotTerm
 
 	if rf.persistedIndex() < maxIndex {
 		// update the persisted index
-		rf.updatePersistedIndex(maxIndex)
+		rf.setPersistedIndex(maxIndex)
+	}
+
+	// update the commit index, cuz the snapshot index <= the leader's commit index
+	if rf.commitIndex < args.SnapshotIndex {
+		rf.commitIndex = args.SnapshotIndex
+		notifyApplier = rf.commitIndex > rf.lastApplied
 	}
 
 	e.Encode(rf.currentTerm)
@@ -1157,13 +1213,11 @@ func (rf *Raft) InstallSnapshot(args *SendSnapshotArgs, reply *SendSnapshotReply
 	reply.Success = true
 }
 
-func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
-	// TODO:
-	// 1. RUN with race
-	// 2. test test test
-
+func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) (isLeader bool, ok bool) {
 	args := SendSnapshotArgs{Rid: rid, LeaderId: rf.me}
 	reply := SendSnapshotReply{}
+	isLeader = true
+	ok = false
 
 	rf.mu.Lock()
 
@@ -1173,6 +1227,7 @@ func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
 		rf.assertf(rid, term < curTerm, "term: %v cannot be greater than the current term: %v\n",
 			term, curTerm)
 		rf.mu.Unlock()
+		isLeader = false
 		return
 	}
 	args.Term = curTerm
@@ -1186,7 +1241,7 @@ func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
 
 	rf.logf(rid, "Send snapshot enter: CurrentTerm: %v, SIndex: %v, STerm: %v\n",
 		args.Term, args.SnapshotIndex, args.SnapshotTerm)
-	ok := rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
+	ok = rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
 	if !ok {
 		rf.logf(rid, "Send snapshot to %v failed.\n", peer)
 		return
@@ -1199,9 +1254,11 @@ func (rf *Raft) sendSnapshot(rid uint32, peer int, term int) {
 			"reply's term = %v.\n", reply.Term)
 		rf.assertf(rid, reply.Term > term, "There couldn't be a lower term in the reply.\n")
 		rf.refreshTerm(reply.Term)
+		isLeader = false
 	}
 	// We wouldn't do anything here even if the follower rejected to receive the snapshot. The
 	// later sending heartbeats message, if it's still the leader, will figure it out.
+	return
 }
 
 // the service or tester wants to create a Raft server. the ports
