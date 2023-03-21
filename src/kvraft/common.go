@@ -4,30 +4,38 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrRetry       = "ErrRetry"
+)
+
+const (
+	OP_GET uint8 = iota
+	OP_PUT
+	OP_APPEND
 )
 
 type Err string
 
-// Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	RequestId uint64
+	ClientId  int
+	Key       string
+	Value     string
+	Opcode    uint8 // "Put" or "Append"
 }
 
 type PutAppendReply struct {
-	Err Err
+	RequestId uint64
+	Err       Err
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	RequestId uint64 // used for de-duplication and identification
+	ClientId  int
+	Key       string
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	RequestId uint64
+	Err       Err
+	Value     string
 }
