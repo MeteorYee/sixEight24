@@ -12,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -173,7 +173,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 
 	kv.assertf(!isProcessing && !hasServed,
-		"There shall never be duplicated Get requests.args: %+v, new: %v, served: %v\n",
+		"There shall never be duplicated Get requests. args: %+v, new: %v, served: %v\n",
 		*args, isProcessing, hasServed)
 
 	// Because Get operation has got no side effects, we don't care if the request id is duplicated
@@ -350,27 +350,30 @@ func (kv *KVServer) applyCommand(cmd *Op, index int) {
 	}
 
 	reply.value, foundKey = kv.table[cmd.Key]
-
-	switch cmd.Opcode {
-	case OP_GET:
-		if !foundKey {
-			reply.err = SvUnknownKey
-		}
-	case OP_PUT:
-		kv.table[cmd.Key] = cmd.Value
-	case OP_APPEND:
-		if foundKey {
-			kv.table[cmd.Key] += cmd.Value // TODO: need check duplicate first!!!
-		} else {
-			kv.table[cmd.Key] = cmd.Value
-		}
-	default:
-		kv.assertf(false, "The applier has got an unknown op: %v\n", cmd.Opcode)
-	}
-
-	// update the max served id
 	id, ok := kv.maxSrvdIds[cmd.ClientId]
-	kv.maxSrvdIds[cmd.ClientId] = cmd.RequestId
+	isdup := ok && id >= cmd.RequestId
+
+	if !isdup {
+		// update the max served id if it applies
+		kv.maxSrvdIds[cmd.ClientId] = cmd.RequestId
+
+		switch cmd.Opcode {
+		case OP_GET:
+			if !foundKey {
+				reply.err = SvUnknownKey
+			}
+		case OP_PUT:
+			kv.table[cmd.Key] = cmd.Value
+		case OP_APPEND:
+			if foundKey {
+				kv.table[cmd.Key] += cmd.Value
+			} else {
+				kv.table[cmd.Key] = cmd.Value
+			}
+		default:
+			kv.assertf(false, "The applier has got an unknown op: %v\n", cmd.Opcode)
+		}
+	}
 
 	kv.mu.Unlock()
 	if hasEntry {
@@ -378,19 +381,20 @@ func (kv *KVServer) applyCommand(cmd *Op, index int) {
 		close(entry.ch)
 	}
 
-	if ok && id >= cmd.RequestId {
+	if isdup {
 		// This happens when the client first sent the request to server A who didn't make it to
 		// commit the operation, but successfully distributed the log L1 to server B. Then the
 		// client gave up communicating with A and connected with B, where a new but duplicate log
-		// L2 generated, because at this time B had no idea that L1 (L1 carries the same information
-		// with L2 in theory) had already been logged by A in the past. Henceforth, B will first
-		// apply L1 which should be undoubtably executed and then ignore L2.
+		// L2 generated, because at this time B had no idea that L1, which carries basically the
+		// same information as L2, had already been logged by A in the past. Henceforth, B will
+		// first undoubtably apply L1 and then ignore L2.
 		DPrintf("kv:%v found a duplicate request (r:%v, c:%v) in log idx:%v, ignore it!\n", kv.me,
 			cmd.RequestId, cmd.ClientId, index)
-	} else {
-		DPrintf("kv:%v applied command:%+v idx:%v, clientExists: %v, hasEntry: %v\n", kv.me, *cmd,
-			index, clientExists, hasEntry)
 	}
+	// else {
+	// 	DPrintf("kv:%v applied command:%+v idx:%v, clientExists: %v, hasEntry: %v\n", kv.me, *cmd,
+	// 		index, clientExists, hasEntry)
+	// }
 }
 
 func (kv *KVServer) applyRoutine() {

@@ -1,9 +1,7 @@
 package kvraft
 
 import (
-	"crypto/rand"
 	"log"
-	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +24,14 @@ type Clerk struct {
 	retryCount     uint32
 }
 
+/*
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
 	return x
 }
+*/
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
@@ -108,6 +108,9 @@ func (ck *Clerk) Get(key string) string {
 			ok := server.Call("KVServer.Get", &args, &reply)
 			DPrintf("clnt:%v Get request ends, (r:%v, c:%v), ok:%v, err:%+v\n", args.ClientId,
 				args.RequestId, args.ClientId, ok, reply.Err)
+			if ok && args.RequestId != reply.RequestId {
+				log.Fatalf("Unmatched request ID! args: %+v, reply: %+v", args, reply)
+			}
 			ch <- ok
 			close(ch)
 		}(ck.servers[ck.lastLeaderId])
@@ -161,6 +164,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ok := server.Call("KVServer.PutAppend", &args, &reply)
 			DPrintf("clnt:%v P/A request ends, (r:%v, c:%v), ok:%v, err:%+v\n", args.ClientId,
 				args.RequestId, args.ClientId, ok, reply.Err)
+			if ok && args.RequestId != reply.RequestId {
+				log.Fatalf("Unmatched request ID! args: %+v, reply: %+v", args, reply)
+			}
 			ch <- ok
 			close(ch)
 		}(ck.servers[ck.lastLeaderId])
