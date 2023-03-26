@@ -44,36 +44,41 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) switchLeader() {
+	ck.lastLeaderId = (ck.lastLeaderId + 1) % len(ck.servers)
+	ck.clct++
+	if ck.clct == len(ck.servers) {
+		// We have tried all the servers but none of them said it's the leader. In this case,
+		// we just sleep for a while and hopefully they can elect a leader.
+		time.Sleep(time.Duration(raft.ELECTION_TIME_OUT_HI*2) * time.Millisecond)
+		ck.clct = 0
+	}
+	ck.retryCount = 0
+}
+
 func (ck *Clerk) handleReply(rpcOK bool, err Err) bool {
 	if !rpcOK {
-		return false
+		err = ErrRetry
 	}
 
-	ck.retryCount = 0
 	success := true
 	switch err {
 	case OK:
 		fallthrough
 	case ErrNoKey:
-		success = true
+		ck.retryCount = 0
+		ck.clct = 0
 	case ErrWrongLeader:
-		ck.lastLeaderId = (ck.lastLeaderId + 1) % len(ck.servers)
-		fallthrough
+		ck.switchLeader()
+		success = false
 	case ErrRetry:
+		ck.retryCount++
+		if ck.retryCount > CLNT_MAX_RETRY_CNT {
+			ck.switchLeader()
+		}
 		success = false
 	default:
 		log.Fatalf("clnt:%v Unknown error code: %v in handleReply.\n", ck.clientId, err)
-	}
-
-	if err == ErrWrongLeader {
-		ck.clct++
-		if ck.clct == len(ck.servers) {
-			// We have tried all the servers but none of them said it's the leader. In this case,
-			// we just sleep for a while and hopefully they can elect a leader.
-			time.Sleep(time.Duration(raft.ELECTION_TIME_OUT_HI*2) * time.Millisecond)
-		}
-	} else {
-		ck.clct = 0
 	}
 	return success
 }
@@ -92,11 +97,6 @@ func (ck *Clerk) Get(key string) string {
 	retry := true
 	value := ""
 	for retry {
-		ck.retryCount++
-		if ck.retryCount > CLNT_MAX_RETRY_CNT {
-			ck.lastLeaderId = (ck.lastLeaderId + 1) % len(ck.servers)
-		}
-
 		// For Get requests, we don't insist on the same request ID again and again.
 		args := GetArgs{RequestId: atomic.AddUint64(&ck.requestCounter, 1), ClientId: ck.clientId,
 			Key: key}
@@ -151,11 +151,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key: key, Value: value, Opcode: opcode}
 	retry := true
 	for retry {
-		ck.retryCount++
-		if ck.retryCount > CLNT_MAX_RETRY_CNT {
-			ck.lastLeaderId = (ck.lastLeaderId + 1) % len(ck.servers)
-		}
-
 		reply := PutAppendReply{}
 		ch := make(chan bool, 1)
 		go func(server *labrpc.ClientEnd) {

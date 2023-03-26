@@ -113,7 +113,7 @@ type Raft struct {
 
 	enableLog bool
 
-	applyCh chan ApplyMsg
+	applyCh chan<- ApplyMsg
 
 	hrtbtCh     chan struct{} // used for invoking a heartbeat explicitly
 	hrtbtReqCnt int32         // records the number of heartbeat request issued by users
@@ -278,6 +278,10 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.assertf(0, err == nil, "Failed to read logs from persister, errmsg: %v\n", err)
 
 	rf.setPersistedIndex(rf.lastLogEntry().Index)
+
+	// This may not be accurate, but it works, which is based on the assumption:
+	// the max commit index in the cluster >= snapshot index.
+	rf.commitIndex = rf.lastSnapshot().Index
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -299,7 +303,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	lastSnapshot := rf.lastSnapshot()
 	lastSnapshotIndex := lastSnapshot.Index
 	// In theory, the upper level users know no more indices greater than the local committed index.
-	// However, the Raft leader may or may not observe to this constraint under the hood.
 	rf.assertf(0, index <= rf.lastApplied, "Invalid snapshot index: %v, lastAppliedIndex: %v, "+
 		"lastSnapshot: %v\n", index, rf.lastApplied, lastSnapshotIndex)
 
@@ -312,9 +315,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	// update the snapshot index
 	maxIndex := rf.lastLogEntry().Index
+	snpTerm := rf.getLogEntry(0, index).Term
 	rf.logs = append(rf.logs[:1], rf.logSlice(0, index+1, maxIndex+1)...)
 	lastSnapshot.Index = index
-	lastSnapshot.Term = rf.currentTerm
+	lastSnapshot.Term = snpTerm
 
 	lastPersistedIndex := rf.persistedIndex()
 	rf.setPersistedIndex(maxIndex)
@@ -327,8 +331,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Unlock()
 
 	rf.logf(0, "User snapshot succeeded, persisted index modified from %v to %v, "+
-		"snapshot index modified from %v to %v\n", lastPersistedIndex, maxIndex,
-		lastSnapshotIndex, index)
+		"snapshot index modified from %v to %v. snpTerm:%v\n", lastPersistedIndex, maxIndex,
+		lastSnapshotIndex, index, snpTerm)
 }
 
 // example RequestVote RPC arguments structure.
@@ -381,6 +385,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.CandidateId == rf.votedFor {
 		reply.VoteGranted = args.LastLogTerm > lastEntry.Term ||
 			(args.LastLogTerm == lastEntry.Term && args.LastLogIndex >= lastEntry.Index)
+		if !reply.VoteGranted {
+			rf.votedFor = -1
+		}
 	}
 	if !rf.hasPinged {
 		// We only think we're pinged by others when we successfully voted for somebody, because
@@ -712,14 +719,21 @@ type AppendEntryReply struct {
 // `lastSnapshotIndex` value should be consistent between two peers before calling
 // this method.
 func (rf *Raft) binSearchPrevTerm(rid uint64, term int, index int) (prevTerm int, lastIndex int) {
-	lastSnapshotIndex := rf.lastSnapshot().Index
+	lastSnapshot := rf.lastSnapshot()
 	rf.assertf(rid, index != 0, "binSearchPrevTerm index must not be zero\n")
-	rf.assertf(rid, index > lastSnapshotIndex, "Inconsistent index in binSearch. "+
-		"index = %v, lastSnapshotIndex = %v\n", index, lastSnapshotIndex)
+	rf.assertf(rid, index > lastSnapshot.Index, "Inconsistent index in binSearch. "+
+		"index = %v, lastSnapshot = %+v\n", index, *lastSnapshot)
+	if term == lastSnapshot.Term {
+		// we won't be able to find an entry from the previous term
+		prevTerm = term
+		lastIndex = lastSnapshot.Index
+		return
+	}
+
 	prevTerm = 0
 	lastIndex = 0
 	left := 0
-	right := index - lastSnapshotIndex
+	right := index - lastSnapshot.Index
 	var mid int
 
 	for left <= right {
@@ -783,19 +797,34 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.maxRcvHrtbtId = args.Hbid
 
 	lastSnapshotIndex := rf.lastSnapshot().Index
-	if args.LeaderSnapshotIndex != lastSnapshotIndex {
-		rf.logf(rid, "The follower has got an inconsistent snapshot. leader: %v, self: %v\n",
+	if args.LeaderSnapshotIndex > lastSnapshotIndex {
+		rf.logf(rid, "The follower has got an older snapshot. leader: %v, self: %v\n",
 			args.LeaderSnapshotIndex, lastSnapshotIndex)
 		reply.NeedSnapshot = true
 		return
+	} else if args.LeaderSnapshotIndex < lastSnapshotIndex {
+		rf.logf(rid, "The follower has got a newer snapshot. leader: %v, self: %v\n",
+			args.LeaderSnapshotIndex, lastSnapshotIndex)
+		rf.assertf(rid, lastSnapshotIndex <= rf.commitIndex,
+			"Illegal snapshot index:%v, commitIdx:%v\n", lastSnapshotIndex, rf.commitIndex)
 	}
 
 	lastEntry := rf.lastLogEntry()
 	leaderPrevIndex := args.PrevLogIndex
 	if leaderPrevIndex > lastEntry.Index {
-		rf.logf(rid, "The follower has not got enough log entries as the leader expected.\n")
+		rf.logf(rid, "The prevIdx:%v is too big. maxIdx:%v, commitIdx:%v\n",
+			leaderPrevIndex, lastEntry.Index, rf.commitIndex)
 		reply.PrevTerm = lastEntry.Term
 		reply.MagicIndex = lastEntry.Index
+		return
+	}
+
+	if leaderPrevIndex < rf.commitIndex {
+		// When the prev index is too small, it might be caused by a(n) older/duplicate request.
+		rf.logf(rid, "The prevIdx:%v is too small. maxIdx:%v, commitIdx:%v\n",
+			leaderPrevIndex, lastEntry.Index, rf.commitIndex)
+		reply.PrevTerm = rf.getLogEntry(rid, rf.commitIndex).Term
+		reply.MagicIndex = rf.commitIndex
 		return
 	}
 
@@ -806,35 +835,47 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
+	if leaderPrevIndex < lastEntry.Index && lastEntry.Term == args.Term {
+		// The follower has got the logs up to lastEntry.Index the same with the leader's,
+		// even if the leader prev index is lower than the last index.
+		if leaderPrevIndex+len(args.Entries) > lastEntry.Index {
+			args.Entries = args.Entries[lastEntry.Index-leaderPrevIndex:]
+		} else {
+			args.Entries = make([]LogEntry, 0)
+		}
+		leaderPrevIndex = lastEntry.Index
+	}
+
 	if rf.persistedIndex() > leaderPrevIndex || len(args.Entries) > 0 {
 		// we cannot append the entries directly, there may be overlapped ones
-		if len(args.Entries) > 0 {
-			rf.logs = append(rf.logSlice(rid, lastSnapshotIndex, leaderPrevIndex+1), args.Entries...)
-		} else {
+		if leaderPrevIndex < lastEntry.Index {
 			rf.logs = rf.logSlice(rid, lastSnapshotIndex, leaderPrevIndex+1)
+		}
+		if len(args.Entries) > 0 {
+			rf.logs = append(rf.logs, args.Entries...)
 		}
 		rf.persist(rid)
 	}
 
 	if args.LeaderCommitIndex > rf.commitIndex {
 		rf.commitIndex = intmin(args.LeaderCommitIndex, rf.persistedIndex())
-		notifyApplier = rf.commitIndex > rf.lastApplied && rf.commitIndex >= lastSnapshotIndex
+		notifyApplier = rf.commitIndex > rf.lastApplied
 	}
 
 	rf.logf(rid, "AppendEntry succeeded, peer commit idx: %v, leader's one: %v, last idx: %v"+
 		", lastSnapshotIndex = %v\n", rf.commitIndex, args.LeaderCommitIndex,
 		rf.lastLogEntry().Index, lastSnapshotIndex)
 	reply.Success = true
-	reply.PrevTerm = 0
+	reply.PrevTerm = 0 // no use for a successful reply
 	reply.MagicIndex = rf.persistedIndex()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 	rid := args.Rid
 	rf.logf(rid, "Begin sendAppendEntries to %v, term = %v, leader = %v, prevLogIndex = %v, "+
-		"prevLogTerm = %v, leaderCommit = %v, len(logEntries) = %v, hbid = %v\n", server, args.Term,
-		args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommitIndex,
-		len(args.Entries), args.Hbid)
+		"prevLogTerm = %v, leaderCommit = %v, len(logEntries) = %v, hbid = %v, sindex = %v\n",
+		server, args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm,
+		args.LeaderCommitIndex, len(args.Entries), args.Hbid, args.LeaderSnapshotIndex)
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
@@ -876,8 +917,8 @@ func (rf *Raft) constructAppEntryMsg(rid uint64, peer int, args *AppendEntryArgs
 	if nextIndex <= lastSnapshotIndex {
 		// we can just send the snapshot directly
 		needSnapshot = true
-		rf.nextIndex[peer] = lastSnapshotIndex + 1
 		nextIndex = lastSnapshotIndex + 1
+		rf.nextIndex[peer] = nextIndex
 	}
 
 	if nextIndex != lastEntry.Index+1 {
@@ -930,11 +971,7 @@ func (rf *Raft) handleHeartbeatReply(rid uint64, hbid uint64, peer int, term int
 		return
 	}
 
-	curSnapshotIdx := rf.lastSnapshot().Index
-	if args.LeaderSnapshotIndex != curSnapshotIdx {
-		rf.assertf(rid, args.LeaderSnapshotIndex < curSnapshotIdx, "snapshot index out of"+
-			" order, the one in args: %v, current one: %v\n", args.LeaderSnapshotIndex,
-			curSnapshotIdx)
+	if reply.MagicIndex < rf.lastSnapshot().Index {
 		// the snapshot has been updated when we're doing the RPC, we need to send the new one
 		reply.NeedSnapshot = true
 	}
@@ -1044,7 +1081,7 @@ func (rf *Raft) refreshLeaderInfo(rid uint64, term int) (int, bool) {
 			rf.commitIndex, commitIndex, term)
 		rf.commitIndex = matcharr[npeers-1]
 	}
-	notifyApplier = rf.commitIndex > rf.lastApplied && rf.commitIndex >= rf.lastSnapshot().Index
+	notifyApplier = rf.commitIndex > rf.lastApplied
 	return rf.commitIndex, true
 }
 
@@ -1090,7 +1127,7 @@ func (rf *Raft) getNextApplyInfo(rid uint64, msg *ApplyMsg) (commitIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for rf.commitIndex <= rf.lastApplied || rf.commitIndex < rf.lastSnapshot().Index {
+	for rf.commitIndex <= rf.lastApplied {
 		rf.applyCond.Wait()
 	}
 
