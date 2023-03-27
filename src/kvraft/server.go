@@ -320,7 +320,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.snpshtcond.Signal()
 }
 
 func (kv *KVServer) killed() bool {

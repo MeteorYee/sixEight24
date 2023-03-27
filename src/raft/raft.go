@@ -79,6 +79,22 @@ func intmin(a, b int) int {
 	return b
 }
 
+func voteChanSend(ch chan<- VoteChannelMsg, msg VoteChannelMsg) {
+	timer := time.After(time.Duration(ELECTION_TIME_OUT_HI) * time.Millisecond)
+	select {
+	case ch <- msg:
+	case <-timer:
+	}
+}
+
+func hrtbtChanSend(ch chan<- bool, msg bool) {
+	timer := time.After(time.Duration(HEARTBEAT_TIME_OUT) * time.Millisecond)
+	select {
+	case ch <- msg:
+	case <-timer:
+	}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
@@ -488,7 +504,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -583,7 +599,7 @@ func (rf *Raft) sendVoteRoutine(rid uint64, peer int, term int, ch chan VoteChan
 
 	if curTerm != term {
 		rf.logf(rid, "Found term unmatched before sending vote request.\n")
-		ch <- VoteChannelMsg{abortElection: true, voteGranted: false}
+		voteChanSend(ch, VoteChannelMsg{abortElection: true, voteGranted: false})
 		return
 	}
 
@@ -597,7 +613,7 @@ func (rf *Raft) sendVoteRoutine(rid uint64, peer int, term int, ch chan VoteChan
 	ok := rf.sendRequestVote(peer, &args, &reply)
 	if !ok {
 		rf.logf(rid, "Server %v's vote request to %v has failed.\n", rf.me, peer)
-		ch <- VoteChannelMsg{abortElection: false, voteGranted: false}
+		voteChanSend(ch, VoteChannelMsg{abortElection: false, voteGranted: false})
 		return
 	}
 
@@ -606,13 +622,13 @@ func (rf *Raft) sendVoteRoutine(rid uint64, peer int, term int, ch chan VoteChan
 			"reply's term = %v.\n", rf.me, reply.Term)
 		rf.assertf(rid, reply.Term > term, "There couldn't be a lower term in the reply.\n")
 		rf.refreshTerm(reply.Term)
-		ch <- VoteChannelMsg{abortElection: true, voteGranted: false}
+		voteChanSend(ch, VoteChannelMsg{abortElection: true, voteGranted: false})
 		// term has changed, we give up competing the election
 		return
 	}
 
 	// the channel is buffered so it won't be blocked
-	ch <- VoteChannelMsg{abortElection: false, voteGranted: reply.VoteGranted}
+	voteChanSend(ch, VoteChannelMsg{abortElection: false, voteGranted: reply.VoteGranted})
 }
 
 func (rf *Raft) collectVotes(rid uint64, term int) {
@@ -967,7 +983,7 @@ func (rf *Raft) handleHeartbeatReply(rid uint64, hbid uint64, peer int, term int
 		}
 		rf.mu.Unlock()
 		// term has changed, we give up sending more heartbeats
-		ch <- false
+		hrtbtChanSend(ch, false)
 		return
 	}
 
@@ -993,7 +1009,7 @@ func (rf *Raft) handleHeartbeatReply(rid uint64, hbid uint64, peer int, term int
 		}
 	}
 	rf.mu.Unlock()
-	ch <- true
+	hrtbtChanSend(ch, true)
 
 	if reply.NeedSnapshot {
 		go rf.sendSnapshot(atomic.AddUint64(&rf.routineId, 1), peer, term)
@@ -1012,7 +1028,7 @@ func (rf *Raft) appendEntryRoutine(rid uint64, hbid uint64, peer int, term int, 
 		isLeader, ok = rf.sendSnapshot(rid, peer, term)
 	}
 	if !isLeader || !ok {
-		ch <- isLeader
+		hrtbtChanSend(ch, isLeader)
 		return
 	}
 
@@ -1026,7 +1042,7 @@ func (rf *Raft) appendEntryRoutine(rid uint64, hbid uint64, peer int, term int, 
 	if !ok {
 		rf.logf(rid, "%v's sendAppendEntries to %v has failed.\n", rf.me, peer)
 		// Although the rpc failed this time, we still don't give it up.
-		ch <- true
+		hrtbtChanSend(ch, true)
 		return
 	}
 
@@ -1127,11 +1143,15 @@ func (rf *Raft) getNextApplyInfo(rid uint64, msg *ApplyMsg) (commitIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for rf.commitIndex <= rf.lastApplied {
+	for !rf.killed() && rf.commitIndex <= rf.lastApplied {
 		rf.applyCond.Wait()
 	}
 
 	*msg = ApplyMsg{} // zero out the msg
+	if rf.killed() {
+		return
+	}
+
 	snapshot := rf.lastSnapshot()
 	commitIndex = rf.commitIndex
 	if rf.lastApplied < snapshot.Index {
@@ -1162,14 +1182,18 @@ func (rf *Raft) applyRoutine(rid uint64) {
 		commitIndex := rf.getNextApplyInfo(rid, &msg)
 		if msg.SnapshotValid {
 			rf.logf(rid, "Applying snapshot: idx:%v, term:%v\n", msg.SnapshotIndex, msg.SnapshotTerm)
-		} else {
+		} else if msg.CommandValid {
 			rf.assertf(rid, msg.Command != nil,
 				"The command must not be nil when we have something to apply\n")
 			rf.logf(rid, "Applier got next apply info, cmdIndex = %v, commitIndex = %v, command = %v\n",
 				msg.CommandIndex, commitIndex, msg.Command)
+		} else {
+			rf.logf(rid, "Applier is exiting..., raft killed:%v\n", rf.killed())
+			break
 		}
 		rf.applyCh <- msg
 	}
+	close(rf.applyCh)
 }
 
 type SendSnapshotArgs struct {
