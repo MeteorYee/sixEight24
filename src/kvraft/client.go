@@ -1,9 +1,7 @@
 package kvraft
 
 import (
-	"crypto/rand"
 	"log"
-	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -20,66 +18,47 @@ var g_clientCounter int32 = 0
 type Clerk struct {
 	servers        []*labrpc.ClientEnd
 	clientId       int
-	shadowClntId   int // used for fake Get operations
 	lastLeaderId   int
 	requestCounter uint64
 	clct           int // continuous leader changed times
 	retryCount     uint32
 }
 
+/*
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
 	return x
 }
-
-func (ck *Clerk) fakeClientId() int {
-	i := int(nrand())
-	for i == ck.clientId {
-		i = int(nrand())
-	}
-	return i
-}
+*/
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.clientId = int(atomic.AddInt32(&g_clientCounter, 1))
-	ck.shadowClntId = ck.fakeClientId()
 	ck.lastLeaderId = 0
 	ck.requestCounter = 0
 	ck.clct = 0
 	ck.retryCount = 0
-	DPrintf("Made client:%v, shadow id:%v.\n", ck.clientId, ck.shadowClntId)
 	return ck
 }
 
-func (ck *Clerk) switchLeader(opcode uint8) {
+func (ck *Clerk) switchLeader() {
 	ck.lastLeaderId = (ck.lastLeaderId + 1) % len(ck.servers)
+	DPrintf("clnt:%v, Leader changed to %v.\n", ck.clientId, ck.lastLeaderId)
 	ck.clct++
-	if ck.clct%len(ck.servers) != 0 {
+	if ck.clct != len(ck.servers) {
 		return
 	}
-	if opcode != OP_GET {
-		// There are times that the Raft leader just can't move on because it has no logs from
-		// the current term. Then P/A operations will get stuck. Hence, this is why we're doing
-		// a fake Get here, thanks to that Get operations can generate new log entries. However,
-		// we could modify the Raft implementation by letting a leader commit a no-op log every
-		// time it claims its leadership. Although the trick seems a better choice, it would
-		// fail the lab2 test cases, unfortunately.
-		ck.clientId, ck.shadowClntId = ck.shadowClntId, ck.clientId
-		ck.Get("")
-		ck.clientId, ck.shadowClntId = ck.shadowClntId, ck.clientId
-	} else {
-		// We have tried all the servers but none of them said it's the leader. In this case,
-		// we just sleep for a while and hopefully they can elect a leader.
-		time.Sleep(time.Duration(raft.ELECTION_TIME_OUT_HI*2) * time.Millisecond)
-	}
+	// We have tried all the servers but none of them said it's the leader. In this case,
+	// we just sleep for a while and hopefully they can elect a leader.
+	time.Sleep(time.Duration(raft.ELECTION_TIME_OUT_HI*2) * time.Millisecond)
 	ck.retryCount = 0
+	ck.clct = 0
 }
 
-func (ck *Clerk) handleReply(rpcOK bool, err Err, opcode uint8) bool {
+func (ck *Clerk) handleReply(rpcOK bool, err Err) bool {
 	if !rpcOK {
 		err = ErrRetry
 	}
@@ -91,12 +70,12 @@ func (ck *Clerk) handleReply(rpcOK bool, err Err, opcode uint8) bool {
 	case ErrNoKey:
 		ck.retryCount = 0
 	case ErrWrongLeader:
-		ck.switchLeader(opcode)
+		ck.switchLeader()
 		success = false
 	case ErrRetry:
 		ck.retryCount++
 		if ck.retryCount > CLNT_MAX_RETRY_CNT {
-			ck.switchLeader(opcode)
+			ck.switchLeader()
 		}
 		success = false
 	default:
@@ -140,7 +119,7 @@ func (ck *Clerk) Get(key string) string {
 		timer := time.After(time.Duration(CLNT_CHAN_TIME_OUT) * time.Second)
 		select {
 		case ok := <-ch:
-			retry = !ck.handleReply(ok, reply.Err, OP_GET)
+			retry = !ck.handleReply(ok, reply.Err)
 		case <-timer:
 			retry = true
 			DPrintf("clnt:%v Get request RPC: %v times out! Retrying...\n", ck.clientId, args)
@@ -191,7 +170,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		timer := time.After(time.Duration(CLNT_CHAN_TIME_OUT) * time.Second)
 		select {
 		case ok := <-ch:
-			retry = !ck.handleReply(ok, reply.Err, opcode)
+			retry = !ck.handleReply(ok, reply.Err)
 		case <-timer:
 			retry = true
 			DPrintf("clnt:%v P/A request RPC: %v times out! Retrying...\n", ck.clientId, args)

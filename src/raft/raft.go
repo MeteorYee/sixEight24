@@ -942,8 +942,8 @@ func (rf *Raft) constructAppEntryMsg(rid uint64, peer int, args *AppendEntryArgs
 			"The nextIndex = %v of peer %v couldn't be greater than the last index = %v, "+
 				"lastSnapshotIndex = %v\n", nextIndex, peer, lastEntry.Index, lastSnapshotIndex)
 		// todo: if the number of entries is too big, we might need to split them
-		rf.logf(rid, "Leader appends entries, nextIndex = %v, last index = %v, "+
-			"lastSnapshotIndex = %v\n", nextIndex, lastEntry.Index, lastSnapshotIndex)
+		rf.logf(rid, "Leader appends entries to %v, nextIndex = %v, last index = %v, "+
+			"lastSnapshotIndex = %v\n", peer, nextIndex, lastEntry.Index, lastSnapshotIndex)
 		args.Entries = append(args.Entries, rf.logSlice(rid, nextIndex, lastEntry.Index+1)...)
 	}
 

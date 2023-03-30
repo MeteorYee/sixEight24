@@ -26,6 +26,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 const SV_CHAN_TIME_OUT = 2      // 2 seconds
 const SV_SNAPSHOT_FACTOR = 1.25 // when it's SV_SNAPSHOT_FACTOR * maxraftstate, we do snapshot
 const SV_APPLY_CHAN_SIZE = 32   // the apply channel buffer size
+const SV_RESTART_THRESHOLD = 1
 
 type ServerError uint8
 
@@ -53,9 +54,8 @@ type ApplyReply struct {
 }
 
 type RequestEntry struct {
-	clientId  int
-	requestId uint64
-	ch        chan ApplyReply
+	retryCnt int
+	ch       chan ApplyReply
 }
 
 type KVServer struct {
@@ -76,6 +76,7 @@ type KVServer struct {
 	maxSrvdIds map[int]uint64    // {clientId : maxServedId for the client}
 	lastAppIdx int
 
+	// === Volatile States ===
 	reqMap map[int](map[uint64]RequestEntry) // {clientId : {requestId : RequestEntry}}
 }
 
@@ -98,13 +99,18 @@ func (kv *KVServer) timedWait(clntId int, reqId uint64, ch <-chan ApplyReply, se
 }
 
 // `kv.mu` must be acquired while entering into the function
-func (kv *KVServer) isRequestProcessing(clientId int, reqId uint64) bool {
+func (kv *KVServer) checkRequestStatus(clientId int, reqId uint64) (bool, int) {
 	clientMap, ok := kv.reqMap[clientId]
 	isProcessing := false
+	var entry RequestEntry
 	if ok {
-		_, isProcessing = clientMap[reqId]
+		entry, isProcessing = clientMap[reqId]
+		if isProcessing {
+			entry.retryCnt++
+			clientMap[reqId] = entry
+		}
 	}
-	return isProcessing
+	return isProcessing, entry.retryCnt
 }
 
 // `kv.mu` must be acquired while entering into the function
@@ -114,9 +120,9 @@ func (kv *KVServer) hasRequestServed(clientId int, reqId uint64) bool {
 }
 
 // Return values:
-// (1). the channel required to wait for the applier's reply;
-// (2). whether the request has been served, where the first return value will be nil if true
-func (kv *KVServer) buildRequestChan(clientId int, reqId uint64, isProcessing bool) (
+// The 1st is the channel required to wait for the applier's reply;
+// The 2nd is whether the request has been served, where the first return value will be nil if true
+func (kv *KVServer) setOrGetReqChan(clientId int, reqId uint64, isProcessing bool, restart bool) (
 	chan ApplyReply, bool) {
 
 	kv.mu.Lock()
@@ -140,15 +146,19 @@ func (kv *KVServer) buildRequestChan(clientId int, reqId uint64, isProcessing bo
 		kv.assertf(isProcessing, "a pre-existing request entry means a duplicated request arrived\n")
 		DPrintf("kv:%v receives a duplicate (r:%v, c:%v).\n", kv.me, reqId, clientId)
 		appch = entry.ch
+		if restart {
+			entry.retryCnt = 0
+		}
 	} else {
 		appch = make(chan ApplyReply, 1)
-		clientMap[reqId] = RequestEntry{clientId: clientId, requestId: reqId, ch: appch}
+		clientMap[reqId] = RequestEntry{retryCnt: 0, ch: appch}
 	}
 
 	return appch, false
 }
 
-func (kv *KVServer) setRequestChan(clientId int, reqId uint64, ch chan ApplyReply) {
+func (kv *KVServer) setRequestChan(clientId int, reqId uint64, index int, ch chan ApplyReply) {
+	kv.assertf(index > 0, "Invalid index:%v\n", index)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -157,7 +167,7 @@ func (kv *KVServer) setRequestChan(clientId int, reqId uint64, ch chan ApplyRepl
 		clientMap = make(map[uint64]RequestEntry)
 		kv.reqMap[clientId] = clientMap
 	}
-	clientMap[reqId] = RequestEntry{clientId: clientId, requestId: reqId, ch: ch}
+	clientMap[reqId] = RequestEntry{retryCnt: 0, ch: ch}
 }
 
 func (kv *KVServer) explainErr4GetReply(serr ServerError, greply *GetReply) {
@@ -181,7 +191,7 @@ func (kv *KVServer) explainErr4GetReply(serr ServerError, greply *GetReply) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.RequestId = args.RequestId
 	kv.mu.Lock()
-	isProcessing := kv.isRequestProcessing(args.ClientId, args.RequestId)
+	isProcessing, _ := kv.checkRequestStatus(args.ClientId, args.RequestId)
 	hasServed := kv.hasRequestServed(args.ClientId, args.RequestId)
 	kv.mu.Unlock()
 
@@ -205,7 +215,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	// make a buffered channel of size 1 to prevent from blocking the applier
 	ch := make(chan ApplyReply, 1)
-	kv.setRequestChan(args.ClientId, args.RequestId, ch)
+	kv.setRequestChan(args.ClientId, args.RequestId, index, ch)
 
 	chReply := kv.timedWait(args.ClientId, args.RequestId, ch, SV_CHAN_TIME_OUT)
 
@@ -248,9 +258,14 @@ func (kv *KVServer) explainErr4PtAppReply(serr ServerError, preply *PutAppendRep
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.RequestId = args.RequestId
 	kv.mu.Lock()
-	isProcessing := kv.isRequestProcessing(args.ClientId, args.RequestId)
+	isProcessing, retryCnt := kv.checkRequestStatus(args.ClientId, args.RequestId)
 	hasServed := kv.hasRequestServed(args.ClientId, args.RequestId)
 	kv.mu.Unlock()
+
+	// The corresponding log may have been erased, as with the figure 8 in Raft paper. Thus,
+	// we sometimes need to issus another Start() call. One might argue that it will risk
+	// duplicating requests. However, the applier will take care of it anyway.
+	restart := retryCnt > SV_RESTART_THRESHOLD
 
 	//  isProcessing | hasServed | Possible?
 	// --------------+-----------+----------
@@ -267,7 +282,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		"P/A handler, args: %+v, new: %v, served: %v\n", *args, isProcessing, hasServed)
 	if hasServed {
 		reply.Err = OK
-		DPrintf("kv:%v received a duplicated request (args: %+v) which has already been served.\n",
+		DPrintf("kv:%v received a duplicated request args: %+v which has already been served.\n",
 			kv.me, *args)
 		return
 	}
@@ -275,14 +290,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index := -1
 	var term int
 	var isLeader bool
-	if isProcessing {
+	if isProcessing && !restart {
 		term, isLeader = kv.rf.GetState()
 	} else {
 		index, term, isLeader = kv.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
 			Opcode: args.Opcode, Key: args.Key, Value: args.Value})
 	}
-	DPrintf("kv:%v received P/A (r:%v, c:%v), isProcessing:%v, hasServed:%v, index:%v"+
-		", term:%v\n", kv.me, args.RequestId, args.ClientId, isProcessing, hasServed, index, term)
+	DPrintf("kv:%v received P/A (r:%v, c:%v), isProcessing:%v, hasServed:%v, restart:%v, retry:%v"+
+		", index:%v, term:%v\n", kv.me, args.RequestId, args.ClientId, isProcessing, hasServed,
+		restart, retryCnt, index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -291,7 +307,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	ch, hasServed := kv.buildRequestChan(args.ClientId, args.RequestId, isProcessing)
+	ch, hasServed := kv.setOrGetReqChan(args.ClientId, args.RequestId, isProcessing, restart)
 	if hasServed { // we need to check this yet again
 		reply.Err = OK
 		DPrintf("kv:%v received a duplicated request (args: %+v) which has already been served.\n",
@@ -348,10 +364,6 @@ func (kv *KVServer) applyCommand(cmd *Op, index int) {
 	if clientExists {
 		entry, hasEntry = clientMap[cmd.RequestId]
 		if hasEntry {
-			kv.assertf(cmd.ClientId == entry.clientId, "clientId unmatched! (cmd: %v, entry: %+v)\n",
-				cmd, entry)
-			kv.assertf(cmd.RequestId == entry.requestId,
-				"requestId unmatched! (cmd: %v, entry: %+v)\n", cmd, entry)
 			delete(clientMap, cmd.RequestId)
 		}
 	}
@@ -402,10 +414,11 @@ func (kv *KVServer) applyCommand(cmd *Op, index int) {
 		// first undoubtably apply L1 and then ignore L2.
 		DPrintf("kv:%v found a duplicate request (r:%v, c:%v) in log idx:%v, ignore it!\n", kv.me,
 			cmd.RequestId, cmd.ClientId, index)
-	} else {
-		DPrintf("kv:%v applied command:%+v idx:%v, clientExists: %v, hasEntry: %v\n", kv.me, *cmd,
-			index, clientExists, hasEntry)
 	}
+	// else {
+	// 	DPrintf("kv:%v applied command:%+v idx:%v, clientExists: %v, hasEntry: %v\n", kv.me, *cmd,
+	// 		index, clientExists, hasEntry)
+	// }
 
 	if kv.time4Snapshot() && kv.turnOnSnpshtSwitch() {
 		kv.snpshtcond.Signal()
@@ -438,7 +451,8 @@ func (kv *KVServer) applyRoutine() {
 }
 
 func (kv *KVServer) time4Snapshot() bool {
-	return float64(kv.persister.RaftStateSize()) > float64(kv.maxraftstate)*SV_SNAPSHOT_FACTOR
+	return kv.maxraftstate > 0 && float64(kv.persister.RaftStateSize()) >
+		float64(kv.maxraftstate)*SV_SNAPSHOT_FACTOR
 }
 
 func (kv *KVServer) snapshot() {
