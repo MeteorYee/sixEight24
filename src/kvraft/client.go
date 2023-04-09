@@ -1,7 +1,9 @@
 package kvraft
 
 import (
+	"crypto/rand"
 	"log"
+	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -12,31 +14,26 @@ import (
 const CLNT_CHAN_TIME_OUT = 3 // 3 seconds
 const CLNT_MAX_RETRY_CNT = 3
 
-// A hacky counter used for assigning an unique ID to each client
-var g_clientCounter int32 = 0
-
 type Clerk struct {
 	servers        []*labrpc.ClientEnd
-	clientId       int
+	clientId       int64
 	lastLeaderId   int
 	requestCounter uint64
 	clct           int // continuous leader changed times
 	retryCount     uint32
 }
 
-/*
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
 	return x
 }
-*/
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	ck.clientId = int(atomic.AddInt32(&g_clientCounter, 1))
+	ck.clientId = nrand()
 	ck.lastLeaderId = 0
 	ck.requestCounter = 0
 	ck.clct = 0

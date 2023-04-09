@@ -39,7 +39,7 @@ const (
 )
 
 type Op struct {
-	ClientId  int
+	ClientId  int64
 	RequestId uint64
 	Opcode    uint8
 	Key       string
@@ -73,14 +73,14 @@ type KVServer struct {
 
 	// === Persistent States ===
 	table      map[string]string // the table stores all of the KV pairs
-	maxSrvdIds map[int]uint64    // {clientId : maxServedId for the client}
+	maxSrvdIds map[int64]uint64  // {clientId : maxServedId for the client}
 	lastAppIdx int
 
 	// === Volatile States ===
-	reqMap map[int](map[uint64]RequestEntry) // {clientId : {requestId : RequestEntry}}
+	reqMap map[int64](map[uint64]RequestEntry) // {clientId : {requestId : RequestEntry}}
 }
 
-func (kv *KVServer) timedWait(clntId int, reqId uint64, ch <-chan ApplyReply, sec int) ApplyReply {
+func (kv *KVServer) timedWait(clntId int64, reqId uint64, ch <-chan ApplyReply, sec int) ApplyReply {
 	select {
 	case ret, ok := <-ch:
 		if !ok {
@@ -99,7 +99,7 @@ func (kv *KVServer) timedWait(clntId int, reqId uint64, ch <-chan ApplyReply, se
 }
 
 // `kv.mu` must be acquired while entering into the function
-func (kv *KVServer) checkRequestStatus(clientId int, reqId uint64) (bool, int) {
+func (kv *KVServer) checkRequestStatus(clientId int64, reqId uint64) (bool, int) {
 	clientMap, ok := kv.reqMap[clientId]
 	isProcessing := false
 	var entry RequestEntry
@@ -114,7 +114,7 @@ func (kv *KVServer) checkRequestStatus(clientId int, reqId uint64) (bool, int) {
 }
 
 // `kv.mu` must be acquired while entering into the function
-func (kv *KVServer) hasRequestServed(clientId int, reqId uint64) bool {
+func (kv *KVServer) hasRequestServed(clientId int64, reqId uint64) bool {
 	maxSvId, ok := kv.maxSrvdIds[clientId]
 	return ok && maxSvId >= reqId
 }
@@ -122,7 +122,7 @@ func (kv *KVServer) hasRequestServed(clientId int, reqId uint64) bool {
 // Return values:
 // The 1st is the channel required to wait for the applier's reply;
 // The 2nd is whether the request has been served, where the first return value will be nil if true
-func (kv *KVServer) setOrGetReqChan(clientId int, reqId uint64, isProcessing bool, restart bool) (
+func (kv *KVServer) setOrGetReqChan(clientId int64, reqId uint64, isProcessing bool, restart bool) (
 	chan ApplyReply, bool) {
 
 	kv.mu.Lock()
@@ -157,7 +157,7 @@ func (kv *KVServer) setOrGetReqChan(clientId int, reqId uint64, isProcessing boo
 	return appch, false
 }
 
-func (kv *KVServer) setRequestChan(clientId int, reqId uint64, index int, ch chan ApplyReply) {
+func (kv *KVServer) setRequestChan(clientId int64, reqId uint64, index int, ch chan ApplyReply) {
 	kv.assertf(index > 0, "Invalid index:%v\n", index)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -484,7 +484,7 @@ func (kv *KVServer) applySnapshot(data []byte, sindex int) {
 	err := d.Decode(&kv.table)
 	kv.assertf(err == nil, "Failed to decode `table` when applying snapshot, err: %v\n", err)
 
-	kv.maxSrvdIds = make(map[int]uint64)
+	kv.maxSrvdIds = make(map[int64]uint64)
 	err = d.Decode(&kv.maxSrvdIds)
 	kv.assertf(err == nil, "Failed to decode `maxSrvdIds` when applying snapshot, err: %v\n", err)
 
@@ -561,13 +561,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg, SV_APPLY_CHAN_SIZE)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.persister = persister
-	kv.reqMap = make(map[int](map[uint64]RequestEntry))
+	kv.reqMap = make(map[int64](map[uint64]RequestEntry))
 
 	if persister.SnapshotSize() > 0 {
 		kv.applySnapshot(persister.ReadSnapshot(), 0)
 	} else {
 		kv.table = make(map[string]string)
-		kv.maxSrvdIds = make(map[int]uint64)
+		kv.maxSrvdIds = make(map[int64]uint64)
 		kv.lastAppIdx = 0
 	}
 	kv.snpshtcond = *sync.NewCond(&kv.mu)

@@ -17,7 +17,7 @@ type Err string
 
 type PutAppendArgs struct {
 	RequestId uint64
-	ClientId  int
+	ClientId  int64
 	Key       string
 	Value     string
 	Opcode    uint8 // "Put" or "Append"
@@ -30,7 +30,7 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	RequestId uint64 // used for de-duplication and identification
-	ClientId  int
+	ClientId  int64
 	Key       string
 }
 
