@@ -65,7 +65,7 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	snpshtSwitch int32      // used to prevent redundant notifications for snapshot
-	snpshtcond   sync.Cond  // snapshot conditinal varialbe
+	snpshtcond   *sync.Cond // snapshot conditinal varialbe
 	mu           sync.Mutex // protect the server's whole state
 	persister    *raft.Persister
 
@@ -175,7 +175,7 @@ func (kv *KVServer) explainErr4GetReply(serr ServerError, greply *GetReply) {
 	case SvOK:
 		greply.Err = OK
 	case SvSnapshotApply:
-		// When we get the reply by the snapshoter, it means we're not the leader any more.
+		// When we get the reply from the snapshoter, it means we're not the leader any more.
 		greply.Err = ErrWrongLeader
 	case SvChanTimeOut:
 		greply.Err = ErrRetry
@@ -273,7 +273,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// --------------+-----------+----------
 	//        T      |     F     |     T     a duplicate one and not served
 	// --------------+-----------+----------
-	//        F      |     T     |     F     processed ones
+	//        F      |     T     |     T     processed ones
 	// --------------+-----------+----------
 	//        F      |     F     |     T     a new coming one
 	//
@@ -570,7 +570,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		kv.maxSrvdIds = make(map[int64]uint64)
 		kv.lastAppIdx = 0
 	}
-	kv.snpshtcond = *sync.NewCond(&kv.mu)
+	kv.snpshtcond = sync.NewCond(&kv.mu)
 	kv.snpshtSwitch = 0
 
 	go kv.applyRoutine()
