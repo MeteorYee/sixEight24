@@ -170,6 +170,15 @@ func (kv *KVServer) setRequestChan(clientId int64, reqId uint64, index int, ch c
 	clientMap[reqId] = RequestEntry{retryCnt: 0, ch: ch}
 }
 
+func (kv *KVServer) delRequestChan(clientId int64, reqId uint64) {
+	kv.mu.Lock()
+	clientMap, ok := kv.reqMap[clientId]
+	if ok {
+		delete(clientMap, reqId)
+	}
+	kv.mu.Unlock()
+}
+
 func (kv *KVServer) explainErr4GetReply(serr ServerError, greply *GetReply) {
 	switch serr {
 	case SvOK:
@@ -218,17 +227,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.setRequestChan(args.ClientId, args.RequestId, index, ch)
 
 	chReply := kv.timedWait(args.ClientId, args.RequestId, ch, SV_CHAN_TIME_OUT)
+	if chReply.err == SvChanTimeOut {
+		// prevent channel leak
+		kv.delRequestChan(args.ClientId, args.RequestId)
+	}
 
 	kv.explainErr4GetReply(chReply.err, reply)
 	if reply.Err != OK {
-		return
-	}
-
-	_, isLeader = kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		DPrintf("kv:%v is not the leader in Get, (r:%v, c:%v)\n", kv.me, args.RequestId,
-			args.ClientId)
 		return
 	}
 

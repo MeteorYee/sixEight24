@@ -177,6 +177,15 @@ func (sc *ShardCtrler) setOrGetReqChan(clientId int64, reqId uint64, isProcessin
 	return appch, false
 }
 
+func (sc *ShardCtrler) delRequestChan(clientId int64, reqId uint64) {
+	sc.mu.Lock()
+	clientMap, ok := sc.reqMap[clientId]
+	if ok {
+		delete(clientMap, reqId)
+	}
+	sc.mu.Unlock()
+}
+
 func (sc *ShardCtrler) explainErr4QueryReply(serr ServerError, qreply *QueryReply) {
 	switch serr {
 	case SvOK:
@@ -449,17 +458,13 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.setRequestChan(args.ClientId, args.RequestId, index, ch)
 
 	chReply := sc.timedWait(args.ClientId, args.RequestId, ch, SV_CHAN_TIME_OUT)
+	if chReply.err == SvChanTimeOut {
+		// prevent channel leak
+		sc.delRequestChan(args.ClientId, args.RequestId)
+	}
 
 	sc.explainErr4QueryReply(chReply.err, reply)
 	if reply.Err != OK {
-		return
-	}
-
-	_, isLeader = sc.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		DPrintf("sc:%v is not the leader in Query, (r:%v, c:%v)\n", sc.me, args.RequestId,
-			args.ClientId)
 		return
 	}
 
