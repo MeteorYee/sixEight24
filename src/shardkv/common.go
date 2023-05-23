@@ -10,13 +10,20 @@ package shardkv
 //
 
 const (
-	OK              = "OK"
-	ErrNoKey        = "ErrNoKey"
-	ErrWrongGroup   = "ErrWrongGroup"
-	ErrWrongLeader  = "ErrWrongLeader"
-	ErrTimeout      = "ErrTimeout"
-	ErrRenewRequest = "ErrRenewRequest"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrTimeout        = "ErrTimeout"
+	ErrRenewRequest   = "ErrRenewRequest"
+	ErrRetry          = "ErrRetry"
+	ErrAbort          = "ErrAbort"
+	ErrReMigrate      = "ErrReMigrate"
+	ErrTryOlderConfig = "ErrTryOlderConfig"
+	ErrWaitMigrate    = "ErrWaitMigrate"
 )
+
+const WAIT_MIGRATE_TIME_OUT = 10 // millis
 
 type Err string
 
@@ -24,6 +31,7 @@ const (
 	OP_GET uint8 = iota
 	OP_PUT
 	OP_APPEND
+	OP_SHARD_MIGRATE
 )
 
 type PutAppendArgs struct {

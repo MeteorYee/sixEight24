@@ -111,6 +111,8 @@ func (ck *Clerk) Get(key string) string {
 					fallthrough
 				case ErrTimeout:
 					si++
+				case ErrRetry:
+					time.Sleep(WAIT_MIGRATE_TIME_OUT * time.Millisecond)
 				default:
 					log.Fatalf("clnt:%v Invalid error code: %v in Get.\n", ck.clientId, reply.Err)
 				}
@@ -171,6 +173,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					si++
 				case ErrRenewRequest:
 					args.RequestId = atomic.AddUint64(&ck.requestCounter, 1)
+				case ErrRetry:
+					time.Sleep(WAIT_MIGRATE_TIME_OUT * time.Millisecond)
 				default:
 					log.Fatalf("clnt:%v Invalid error code: %v in P/A.\n", ck.clientId, reply.Err)
 				}
