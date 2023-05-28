@@ -20,7 +20,6 @@ const (
 	ErrAbort          = "ErrAbort"
 	ErrReMigrate      = "ErrReMigrate"
 	ErrTryOlderConfig = "ErrTryOlderConfig"
-	ErrWaitMigrate    = "ErrWaitMigrate"
 )
 
 const WAIT_MIGRATE_TIME_OUT = 10 // millis

@@ -76,6 +76,7 @@ func (ck *Clerk) Get(key string) string {
 	args.ClientId = ck.clientId
 	args.Key = key
 
+	ck.config = ck.sm.Query(-1)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -136,6 +137,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		log.Fatalf("clnt:%v Illegal op string (%v) in P/A\n", ck.clientId, op)
 	}
 
+	ck.config = ck.sm.Query(-1)
 	args := PutAppendArgs{RequestId: atomic.AddUint64(&ck.requestCounter, 1), ClientId: ck.clientId,
 		Key: key, Value: value, Opcode: opcode}
 
