@@ -1129,11 +1129,17 @@ func (rf *Raft) heartbeats(rid uint64, term int) {
 				// if it's still the leader, we keep waiting
 				keepWait = isLeader
 			case <-rf.hrtbtCh:
-				reqcnt := atomic.AddInt32(&rf.hrtbtReqCnt, -1)
-				rf.assertf(rid, reqcnt >= 0, "Negative heartbeat request count!\n")
+				reqcnt := atomic.LoadInt32(&rf.hrtbtReqCnt)
+				for !atomic.CompareAndSwapInt32(&rf.hrtbtReqCnt, reqcnt, 0) {
+					reqcnt = atomic.LoadInt32(&rf.hrtbtReqCnt)
+				}
+				rf.assertf(rid, reqcnt > 0, "Non-positive heartbeat request count!\n")
 				keepWait = false
 			case <-timer:
-				keepWait = false
+				if atomic.AddInt32(&rf.hrtbtReqCnt, 1) <= HEARTBEAT_CHAN_SIZE {
+					rf.hrtbtCh <- struct{}{}
+				}
+				timer = time.After(time.Duration(HEARTBEAT_TIME_OUT) * time.Millisecond)
 			}
 		}
 	}
