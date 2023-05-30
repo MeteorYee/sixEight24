@@ -34,10 +34,9 @@ func (kv *ShardKV) logf(format string, a ...interface{}) {
 		kv.gid, kv.me)
 }
 
-const SV_CHAN_TIME_OUT = 2      // 2 seconds
-const SV_SNAPSHOT_FACTOR = 1.25 // when it's SV_SNAPSHOT_FACTOR * maxraftstate, we do snapshot
-const SV_APPLY_CHAN_SIZE = 32   // the apply channel buffer size
-const SV_RESTART_THRESHOLD = 1
+const SV_CHAN_TIME_OUT = 1          // 1 second
+const SV_SNAPSHOT_FACTOR = 1.25     // when it's SV_SNAPSHOT_FACTOR * maxraftstate, we do snapshot
+const SV_APPLY_CHAN_SIZE = 32       // the apply channel buffer size
 const SV_POLL_CFG_TIME_OUT = 100    // millis
 const SV_WAIT_CFG_TIME_OUT_MIN = 10 // millis
 
@@ -161,67 +160,7 @@ func (kv *ShardKV) timedWait(clntId int64, reqId uint64, ch <-chan ApplyReply, s
 	}
 }
 
-// `kv.mu` must be acquired while entering into the function
-func (kv *ShardKV) checkRequestStatus(clientId int64, reqId uint64) (bool, int) {
-	clientMap, ok := kv.reqMap[clientId]
-	isProcessing := false
-	var entry RequestEntry
-	if ok {
-		entry, isProcessing = clientMap[reqId]
-		if isProcessing {
-			entry.retryCnt++
-			clientMap[reqId] = entry
-		}
-	}
-	return isProcessing, entry.retryCnt
-}
-
-// `kv.mu` must be acquired while entering into the function
-func (kv *ShardKV) hasRequestServed(clientId int64, reqId uint64) bool {
-	maxSvId, ok := kv.maxSrvdIds[clientId]
-	return ok && maxSvId >= reqId
-}
-
-// Return values:
-// The 1st is the channel required to wait for the applier's reply;
-// The 2nd is whether the request has been served, where the first return value will be nil if true
-func (kv *ShardKV) setOrGetReqChan(clientId int64, reqId uint64, isProcessing bool, restart bool) (
-	chan ApplyReply, bool) {
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	if kv.hasRequestServed(clientId, reqId) {
-		return nil, true
-	}
-
-	clientMap, ok := kv.reqMap[clientId]
-	if !ok {
-		kv.assertf(!isProcessing, "buildRequestChan: ClientId:%v, RequestId:%v\n",
-			clientId, reqId)
-		clientMap = make(map[uint64]RequestEntry)
-		kv.reqMap[clientId] = clientMap
-	}
-
-	var appch chan ApplyReply
-	entry, hasEntry := clientMap[reqId]
-	if hasEntry {
-		kv.assertf(isProcessing, "a pre-existing request entry means a duplicated request arrived\n")
-		kv.logf("receives a duplicate (r:%v, c:%v).\n", reqId, clientId)
-		appch = entry.ch
-		if restart {
-			entry.retryCnt = 0
-		}
-	} else {
-		appch = make(chan ApplyReply, 1)
-		clientMap[reqId] = RequestEntry{retryCnt: 0, ch: appch}
-	}
-
-	return appch, false
-}
-
-func (kv *ShardKV) setRequestChan(clientId int64, reqId uint64, index int, ch chan ApplyReply) {
-	kv.assertf(index > 0, "Invalid index:%v\n", index)
+func (kv *ShardKV) setRequestChan(clientId int64, reqId uint64, ch chan ApplyReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -230,6 +169,7 @@ func (kv *ShardKV) setRequestChan(clientId int64, reqId uint64, index int, ch ch
 		clientMap = make(map[uint64]RequestEntry)
 		kv.reqMap[clientId] = clientMap
 	}
+	delete(clientMap, reqId) // clear any pre-existing entry
 	clientMap[reqId] = RequestEntry{retryCnt: 0, ch: ch}
 }
 
@@ -308,15 +248,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	kv.mu.Lock()
-	isProcessing, _ := kv.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := kv.hasRequestServed(args.ClientId, args.RequestId)
-	kv.mu.Unlock()
-
-	kv.assertf(!isProcessing && !hasServed,
-		"There shall never be duplicated Get requests. args: %+v, new: %v, served: %v\n",
-		*args, isProcessing, hasServed)
-
+	ch := make(chan ApplyReply, 1)
+	kv.setRequestChan(args.ClientId, args.RequestId, ch)
 	// Because Get operation has got no side effects, we don't care if the request id is duplicated
 	// and just go ahead to do the work.
 	index, term, isLeader := kv.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
@@ -328,12 +261,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		kv.logf("is not the leader in Get, (r:%v, c:%v)\n", args.RequestId,
 			args.ClientId)
+		kv.delRequestChan(args.ClientId, args.RequestId)
 		return
 	}
-
-	// make a buffered channel of size 1 to prevent from blocking the applier
-	ch := make(chan ApplyReply, 1)
-	kv.setRequestChan(args.ClientId, args.RequestId, index, ch)
 
 	chReply := kv.timedWait(args.ClientId, args.RequestId, ch, SV_CHAN_TIME_OUT)
 	if chReply.err == SvChanTimeOut {
@@ -382,58 +312,18 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	kv.mu.Lock()
-	isProcessing, retryCnt := kv.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := kv.hasRequestServed(args.ClientId, args.RequestId)
-	kv.mu.Unlock()
+	ch := make(chan ApplyReply, 1)
+	kv.setRequestChan(args.ClientId, args.RequestId, ch)
 
-	// The corresponding log may have been erased, as with the figure 8 in Raft paper. Thus,
-	// we sometimes need to issus another Start() call. One might argue that it will risk
-	// duplicating requests. However, the applier will take care of it anyway.
-	restart := retryCnt >= SV_RESTART_THRESHOLD
-
-	//  isProcessing | hasServed | Possible?
-	// --------------+-----------+----------
-	//        T      |     T     |     F     served ones got no entries in the reqMap
-	// --------------+-----------+----------
-	//        T      |     F     |     T     a duplicate one and not served
-	// --------------+-----------+----------
-	//        F      |     T     |     T     processed ones
-	// --------------+-----------+----------
-	//        F      |     F     |     T     a new coming one
-	//
-	// A~B + ~AB + ~A~B = A~B + ~A
-	kv.assertf((isProcessing && !hasServed) || !isProcessing,
-		"P/A handler, args: %+v, new: %v, served: %v\n", *args, isProcessing, hasServed)
-	if hasServed {
-		reply.Err = OK
-		kv.logf("received a duplicated request args: %+v which has already been served.\n", *args)
-		return
-	}
-
-	index := -1
-	var term int
-	var isLeader bool
-	if isProcessing && !restart {
-		term, isLeader = kv.rf.GetState()
-	} else {
-		index, term, isLeader = kv.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
-			Shard: args.Shard, Opcode: args.Opcode, Opdata: encodePutAppend(args.Key, args.Value)})
-	}
-	kv.logf("received P/A (r:%v, c:%v), isProcessing:%v, hasServed:%v, restart:%v, retry:%v"+
-		", index:%v, term:%v\n", args.RequestId, args.ClientId, isProcessing, hasServed,
-		restart, retryCnt, index, term)
+	index, term, isLeader := kv.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
+		Shard: args.Shard, Opcode: args.Opcode, Opdata: encodePutAppend(args.Key, args.Value)})
+	kv.logf("received P/A (r:%v, c:%v), index:%v, term:%v\n", args.RequestId, args.ClientId,
+		index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		kv.logf("is not the leader in P/A, (r:%v, c:%v)\n", args.RequestId, args.ClientId)
-		return
-	}
-
-	ch, hasServed := kv.setOrGetReqChan(args.ClientId, args.RequestId, isProcessing, restart)
-	if hasServed { // we need to check this yet again
-		reply.Err = OK
-		kv.logf("received a duplicated request (args: %+v) which has already been served.\n", *args)
+		kv.delRequestChan(args.ClientId, args.RequestId)
 		return
 	}
 
@@ -469,21 +359,21 @@ func (kv *ShardKV) ModifyShard(args *MigrateArgs, reply *MigrateReply) {
 	clntId := int64(-args.Gid)
 	// fake a request id just for the sake of locating the right channel
 	reqId := atomic.AddUint64(&kv.requestCounter, 1)
+	ch := make(chan ApplyReply, 1)
+	kv.setRequestChan(clntId, reqId, ch)
+
 	index, term, isLeader := kv.rf.Start(Op{ClientId: clntId, RequestId: reqId,
 		Shard: args.Shard, Opcode: OP_SHARD_MIGRATE,
 		Opdata: encodeMigrate(args.Cnum, args.State)})
-
 	kv.logf("Received ModifyShard args:%+v, (r:%v, c:%v), index:%v, term:%v\n",
 		*args, reqId, clntId, index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		kv.logf("is not the leader ModifyShard, (gid:%v, tr:%v)\n", args.Gid, args.TraceId)
+		kv.delRequestChan(clntId, reqId)
 		return
 	}
-
-	ch := make(chan ApplyReply, 1)
-	kv.setRequestChan(clntId, reqId, index, ch)
 
 	chReply := kv.timedWait(clntId, reqId, ch, SV_CHAN_TIME_OUT)
 	if chReply.err == SvChanTimeOut {

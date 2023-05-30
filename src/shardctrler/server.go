@@ -40,10 +40,9 @@ const (
 	OP_MOVE
 )
 
-const SV_CHAN_TIME_OUT = 2     // 2 seconds
+const SV_CHAN_TIME_OUT = 1     // 1 seconds
 const SV_SNAPSHOT_FACTOR = 0.9 // when it's SV_SNAPSHOT_FACTOR * maxraftstate, we do snapshot
 const SV_APPLY_CHAN_SIZE = 32  // the apply channel buffer size
-const SV_RESTART_THRESHOLD = 1
 const SV_MAX_RAFT_SATE = 4096
 
 type ApplyReply struct {
@@ -105,29 +104,7 @@ func (sc *ShardCtrler) timedWait(clntId int64, reqId uint64, ch <-chan ApplyRepl
 	}
 }
 
-// `sc.mu` must be acquired while entering into the function
-func (sc *ShardCtrler) checkRequestStatus(clientId int64, reqId uint64) (bool, int) {
-	clientMap, ok := sc.reqMap[clientId]
-	isProcessing := false
-	var entry RequestEntry
-	if ok {
-		entry, isProcessing = clientMap[reqId]
-		if isProcessing {
-			entry.retryCnt++
-			clientMap[reqId] = entry
-		}
-	}
-	return isProcessing, entry.retryCnt
-}
-
-// `sc.mu` must be acquired while entering into the function
-func (sc *ShardCtrler) hasRequestServed(clientId int64, reqId uint64) bool {
-	maxSvId, ok := sc.maxSrvdIds[clientId]
-	return ok && maxSvId >= reqId
-}
-
-func (sc *ShardCtrler) setRequestChan(clientId int64, reqId uint64, index int, ch chan ApplyReply) {
-	sc.assertf(index > 0, "Invalid index:%v\n", index)
+func (sc *ShardCtrler) setRequestChan(clientId int64, reqId uint64, ch chan ApplyReply) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -136,45 +113,8 @@ func (sc *ShardCtrler) setRequestChan(clientId int64, reqId uint64, index int, c
 		clientMap = make(map[uint64]RequestEntry)
 		sc.reqMap[clientId] = clientMap
 	}
+	delete(clientMap, reqId) // clear any pre-existing entry
 	clientMap[reqId] = RequestEntry{retryCnt: 0, ch: ch}
-}
-
-// Return values:
-// The 1st is the channel required to wait for the applier's reply;
-// The 2nd is whether the request has been served, where the first return value will be nil if true
-func (sc *ShardCtrler) setOrGetReqChan(clientId int64, reqId uint64, isProcessing bool, restart bool) (
-	chan ApplyReply, bool) {
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	if sc.hasRequestServed(clientId, reqId) {
-		return nil, true
-	}
-
-	clientMap, ok := sc.reqMap[clientId]
-	if !ok {
-		sc.assertf(!isProcessing, "buildRequestChan: ClientId:%v, RequestId:%v\n",
-			clientId, reqId)
-		clientMap = make(map[uint64]RequestEntry)
-		sc.reqMap[clientId] = clientMap
-	}
-
-	var appch chan ApplyReply
-	entry, hasEntry := clientMap[reqId]
-	if hasEntry {
-		sc.assertf(isProcessing, "a pre-existing request entry means a duplicated request arrived\n")
-		DPrintf("sc:%v receives a duplicate (r:%v, c:%v).\n", sc.me, reqId, clientId)
-		appch = entry.ch
-		if restart {
-			entry.retryCnt = 0
-		}
-	} else {
-		appch = make(chan ApplyReply, 1)
-		clientMap[reqId] = RequestEntry{retryCnt: 0, ch: appch}
-	}
-
-	return appch, false
 }
 
 func (sc *ShardCtrler) delRequestChan(clientId int64, reqId uint64) {
@@ -247,62 +187,22 @@ func encodeQuery(num int) []byte {
 	return w.Bytes()
 }
 
-// For Join/Leave/Move
-//  isProcessing | hasServed | Possible?
-// --------------+-----------+----------
-//        T      |     T     |     F     served ones got no entries in the reqMap
-// --------------+-----------+----------
-//        T      |     F     |     T     a duplicate one and not served
-// --------------+-----------+----------
-//        F      |     T     |     T     processed ones
-// --------------+-----------+----------
-//        F      |     F     |     T     a new coming one
-//
-// A~B + ~AB + ~A~B = A~B + ~A
-
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	reply.RequestId = args.RequestId
-	sc.mu.Lock()
-	isProcessing, retryCnt := sc.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := sc.hasRequestServed(args.ClientId, args.RequestId)
-	sc.mu.Unlock()
 
-	restart := retryCnt > SV_RESTART_THRESHOLD
+	ch := make(chan ApplyReply, 1)
+	sc.setRequestChan(args.ClientId, args.RequestId, ch)
 
-	sc.assertf((isProcessing && !hasServed) || !isProcessing,
-		"Join handler, args: %+v, new: %v, served: %v\n", *args, isProcessing, hasServed)
-	if hasServed {
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (r:%v, c:%v) which has already been served.\n",
-			sc.me, args.RequestId, args.ClientId)
-		return
-	}
-
-	index := -1
-	var term int
-	var isLeader bool
-	if isProcessing && !restart {
-		term, isLeader = sc.rf.GetState()
-	} else {
-		index, term, isLeader = sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
-			Opcode: OP_JOIN, Opdata: encodeJoin(args.Servers)})
-	}
-	DPrintf("sc:%v received Join (r:%v, c:%v), isProcessing:%v, hasServed:%v, restart:%v, retry:%v"+
-		", index:%v, term:%v\n", sc.me, args.RequestId, args.ClientId, isProcessing, hasServed,
-		restart, retryCnt, index, term)
+	index, term, isLeader := sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
+		Opcode: OP_JOIN, Opdata: encodeJoin(args.Servers)})
+	DPrintf("sc:%v received Join (r:%v, c:%v), index:%v, term:%v\n", sc.me, args.RequestId,
+		args.ClientId, index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		DPrintf("sc:%v is not the leader in Join, (r:%v, c:%v)\n", sc.me,
 			args.RequestId, args.ClientId)
-		return
-	}
-
-	ch, hasServed := sc.setOrGetReqChan(args.ClientId, args.RequestId, isProcessing, restart)
-	if hasServed { // we need to check this yet again
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (args: %+v) which has already been served.\n",
-			sc.me, *args)
+		sc.delRequestChan(args.ClientId, args.RequestId)
 		return
 	}
 
@@ -318,47 +218,20 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	reply.RequestId = args.RequestId
-	sc.mu.Lock()
-	isProcessing, retryCnt := sc.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := sc.hasRequestServed(args.ClientId, args.RequestId)
-	sc.mu.Unlock()
 
-	restart := retryCnt > SV_RESTART_THRESHOLD
+	ch := make(chan ApplyReply, 1)
+	sc.setRequestChan(args.ClientId, args.RequestId, ch)
 
-	sc.assertf((isProcessing && !hasServed) || !isProcessing,
-		"Leave handler, args: %+v, new: %v, served: %v\n", *args, isProcessing, hasServed)
-	if hasServed {
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (r:%v, c:%v) which has already been served.\n",
-			sc.me, args.RequestId, args.ClientId)
-		return
-	}
-
-	index := -1
-	var term int
-	var isLeader bool
-	if isProcessing && !restart {
-		term, isLeader = sc.rf.GetState()
-	} else {
-		index, term, isLeader = sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
-			Opcode: OP_LEAVE, Opdata: encodeLeave(args.GIDs)})
-	}
-	DPrintf("sc:%v received Leave (r:%v, c:%v), isProcessing:%v, hasServed:%v, restart:%v, retry:%v"+
-		", index:%v, term:%v\n", sc.me, args.RequestId, args.ClientId, isProcessing, hasServed,
-		restart, retryCnt, index, term)
+	index, term, isLeader := sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
+		Opcode: OP_LEAVE, Opdata: encodeLeave(args.GIDs)})
+	DPrintf("sc:%v received Leave (r:%v, c:%v), index:%v, term:%v\n", sc.me, args.RequestId,
+		args.ClientId, index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		DPrintf("sc:%v is not the leader in Leave, (r:%v, c:%v)\n", sc.me,
 			args.RequestId, args.ClientId)
-		return
-	}
-
-	ch, hasServed := sc.setOrGetReqChan(args.ClientId, args.RequestId, isProcessing, restart)
-	if hasServed { // we need to check this yet again
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (args: %+v) which has already been served.\n",
-			sc.me, *args)
+		sc.delRequestChan(args.ClientId, args.RequestId)
 		return
 	}
 
@@ -374,47 +247,20 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	reply.RequestId = args.RequestId
-	sc.mu.Lock()
-	isProcessing, retryCnt := sc.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := sc.hasRequestServed(args.ClientId, args.RequestId)
-	sc.mu.Unlock()
 
-	restart := retryCnt > SV_RESTART_THRESHOLD
+	ch := make(chan ApplyReply, 1)
+	sc.setRequestChan(args.ClientId, args.RequestId, ch)
 
-	sc.assertf((isProcessing && !hasServed) || !isProcessing,
-		"Move handler, args: %+v, new: %v, served: %v\n", *args, isProcessing, hasServed)
-	if hasServed {
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (r:%v, c:%v) which has already been served.\n",
-			sc.me, args.RequestId, args.ClientId)
-		return
-	}
-
-	index := -1
-	var term int
-	var isLeader bool
-	if isProcessing && !restart {
-		term, isLeader = sc.rf.GetState()
-	} else {
-		index, term, isLeader = sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
-			Opcode: OP_MOVE, Opdata: encodeMove(args.Shard, args.GID)})
-	}
-	DPrintf("sc:%v received Move (r:%v, c:%v), isProcessing:%v, hasServed:%v, restart:%v, retry:%v"+
-		", index:%v, term:%v\n", sc.me, args.RequestId, args.ClientId, isProcessing, hasServed,
-		restart, retryCnt, index, term)
+	index, term, isLeader := sc.rf.Start(Op{ClientId: args.ClientId, RequestId: args.RequestId,
+		Opcode: OP_MOVE, Opdata: encodeMove(args.Shard, args.GID)})
+	DPrintf("sc:%v received Move (r:%v, c:%v), index:%v, term:%v\n", sc.me, args.RequestId,
+		args.ClientId, index, term)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		DPrintf("sc:%v is not the leader in Move, (r:%v, c:%v)\n", sc.me,
 			args.RequestId, args.ClientId)
-		return
-	}
-
-	ch, hasServed := sc.setOrGetReqChan(args.ClientId, args.RequestId, isProcessing, restart)
-	if hasServed { // we need to check this yet again
-		reply.Err = OK
-		DPrintf("sc:%v received a duplicated request (args: %+v) which has already been served.\n",
-			sc.me, *args)
+		sc.delRequestChan(args.ClientId, args.RequestId)
 		return
 	}
 
@@ -430,14 +276,9 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	reply.RequestId = args.RequestId
-	sc.mu.Lock()
-	isProcessing, _ := sc.checkRequestStatus(args.ClientId, args.RequestId)
-	hasServed := sc.hasRequestServed(args.ClientId, args.RequestId)
-	sc.mu.Unlock()
 
-	sc.assertf(!isProcessing && !hasServed,
-		"There shall never be duplicated Query requests. args: %+v, new: %v, served: %v\n",
-		*args, isProcessing, hasServed)
+	ch := make(chan ApplyReply, 1)
+	sc.setRequestChan(args.ClientId, args.RequestId, ch)
 
 	// Because Query operation has got no side effects, we don't care if the request id is duplicated
 	// and just go ahead to do the work.
@@ -448,14 +289,11 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		sc.delRequestChan(args.ClientId, args.RequestId)
 		DPrintf("sc:%v is not the leader in Query, (r:%v, c:%v)\n", sc.me, args.RequestId,
 			args.ClientId)
 		return
 	}
-
-	// make a buffered channel of size 1 to prevent from blocking the applier
-	ch := make(chan ApplyReply, 1)
-	sc.setRequestChan(args.ClientId, args.RequestId, index, ch)
 
 	chReply := sc.timedWait(args.ClientId, args.RequestId, ch, SV_CHAN_TIME_OUT)
 	if chReply.err == SvChanTimeOut {

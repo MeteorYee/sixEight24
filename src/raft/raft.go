@@ -1109,6 +1109,13 @@ func (rf *Raft) heartbeats(rid uint64, term int) {
 	for !rf.killed() && isLeader {
 		rf.logf(rid, "Term %v, commitIndex = %v, leader heartbeats...\n", term, commitIndex)
 		heartbeatId := atomic.AddUint64(&rf.heartbeatCounter, 1)
+		// we can even put the reset further down below after we've set off the AppendEntry routines
+		reqcnt := atomic.LoadInt32(&rf.hrtbtReqCnt)
+		for !atomic.CompareAndSwapInt32(&rf.hrtbtReqCnt, reqcnt, 0) {
+			reqcnt = atomic.LoadInt32(&rf.hrtbtReqCnt)
+		}
+		rf.assertf(rid, reqcnt >= 0, "Negative heartbeat request count!\n")
+
 		for peer := 0; peer < len(rf.peers); peer++ {
 			if peer == rf.me {
 				continue
@@ -1129,11 +1136,6 @@ func (rf *Raft) heartbeats(rid uint64, term int) {
 				// if it's still the leader, we keep waiting
 				keepWait = isLeader
 			case <-rf.hrtbtCh:
-				reqcnt := atomic.LoadInt32(&rf.hrtbtReqCnt)
-				for !atomic.CompareAndSwapInt32(&rf.hrtbtReqCnt, reqcnt, 0) {
-					reqcnt = atomic.LoadInt32(&rf.hrtbtReqCnt)
-				}
-				rf.assertf(rid, reqcnt > 0, "Non-positive heartbeat request count!\n")
 				keepWait = false
 			case <-timer:
 				if atomic.AddInt32(&rf.hrtbtReqCnt, 1) <= HEARTBEAT_CHAN_SIZE {
