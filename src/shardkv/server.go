@@ -52,6 +52,8 @@ const (
 	SvWrongGroup
 	SvHigherConfigNum
 	SvTryOlderConfig
+	SvTryHigherConfig
+	SvWaitMigrate
 )
 
 type Op struct {
@@ -68,6 +70,7 @@ type ApplyReply struct {
 	err    ServerError
 	opcode uint8
 	smap   *map[string]string // used for storing shard data
+	dmap   *map[int64]uint64  // used for deduplication
 }
 
 type RequestEntry struct {
@@ -87,6 +90,7 @@ const (
 	SHRD_VALID
 	SHRD_MOVE_IN
 	SHRD_MOVE_OUT
+	SHRD_QUERY // used for shard state query
 )
 
 type MigrateArgs struct {
@@ -101,6 +105,7 @@ type MigrateReply struct {
 	TraceId   uint64
 	Err       string
 	ShardData map[string]string
+	DedupMap  map[int64]uint64
 }
 
 type ShardKV struct {
@@ -132,7 +137,8 @@ type ShardKV struct {
 	requestCounter uint64
 
 	// client to the controler
-	mck *shardctrler.Clerk
+	mck    *shardctrler.Clerk
+	ctrlmu sync.Mutex
 }
 
 func (kv *ShardKV) getConfig(shard int) (num int, gid int) {
@@ -348,6 +354,14 @@ func (kv *ShardKV) explainErr4MigrateReply(serr ServerError, mreply *MigrateRepl
 	case SvTryOlderConfig:
 		// the shard data requested is not on the current server, try older config
 		mreply.Err = ErrTryOlderConfig
+	case SvTryHigherConfig:
+		// The shard data has been transferred out by a higher config number comparing to its own
+		// number, but the higher number is not higher enough than our current request, so we need
+		// a retrospect.
+		mreply.Err = ErrTryHigherConfig
+	case SvWaitMigrate:
+		// the shard data is under migration on the current server, need to wait
+		mreply.Err = ErrWaitMigrate
 	default:
 		kv.assertf(false, "Got an illegal error code: %v when doing MigrateShard.\n", serr)
 	}
@@ -383,6 +397,10 @@ func (kv *ShardKV) ModifyShard(args *MigrateArgs, reply *MigrateReply) {
 	kv.explainErr4MigrateReply(chReply.err, reply)
 
 	if reply.Err == OK && chReply.smap != nil && len(*chReply.smap) > 0 {
+		kv.assertf(chReply.dmap != nil, "NULL dedup map,(gid:%v, tr:%v)\n", args.Gid, args.TraceId)
+		if len(*chReply.dmap) > 0 {
+			reply.DedupMap = *chReply.dmap
+		}
 		reply.ShardData = *chReply.smap
 	}
 }
@@ -392,8 +410,19 @@ func (kv *ShardKV) ModifyShard(args *MigrateArgs, reply *MigrateReply) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (kv *ShardKV) Kill() {
+	kv.logf("Killing the server...\n")
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	kv.snpshtcond.Signal()
+
+	// wait migrating routine ends
+	kv.mu.Lock()
+	for kv.isMigrating {
+		kv.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+		kv.mu.Lock()
+	}
+	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) killed() bool {
@@ -428,6 +457,10 @@ func (kv *ShardKV) applyCheckState(shard int) (err ServerError) {
 }
 
 func (kv *ShardKV) applyGet(cmd *Op, reply *ApplyReply) {
+	id, ok := kv.maxSrvdIds[cmd.ClientId]
+	isdup := ok && id >= cmd.RequestId
+	kv.assertf(!isdup, "Found duplicates in Get. (r:%v, c:%v)\n", cmd.RequestId, cmd.ClientId)
+
 	reply.err = kv.applyCheckState(cmd.Shard)
 	if reply.err != SvOK {
 		return
@@ -449,10 +482,8 @@ func (kv *ShardKV) applyGet(cmd *Op, reply *ApplyReply) {
 }
 
 func (kv *ShardKV) applyPutAppend(cmd *Op, reply *ApplyReply) {
-	reply.err = kv.applyCheckState(cmd.Shard)
-	if reply.err != SvOK {
-		return
-	}
+	id, ok := kv.maxSrvdIds[cmd.ClientId]
+	isdup := ok && id >= cmd.RequestId
 
 	r := bytes.NewBuffer(cmd.Opdata)
 	d := labgob.NewDecoder(r)
@@ -465,7 +496,16 @@ func (kv *ShardKV) applyPutAppend(cmd *Op, reply *ApplyReply) {
 	kv.assertf(err == nil, "Failed to decode `value` when applying P/A, err: %v\n", err)
 
 	reply.key = key
+	reply.err = kv.applyCheckState(cmd.Shard)
+	if reply.err != SvOK {
+		return
+	}
 	_, foundKey := kv.table[cmd.Shard][key]
+	if isdup {
+		kv.assertf(foundKey, "Duplicated request finds no key matched! (r:%v, c:%v)",
+			cmd.RequestId, cmd.ClientId)
+		return
+	}
 
 	if cmd.Opcode == OP_PUT {
 		kv.table[cmd.Shard][key] = value
@@ -489,11 +529,17 @@ func (kv *ShardKV) clearShardData(shard int) {
 }
 
 func (kv *ShardKV) copyShardData(shard int, reply *ApplyReply) {
-	m := make(map[string]string, len(kv.table[shard]))
+	sm := make(map[string]string, len(kv.table[shard]))
 	for k, v := range kv.table[shard] {
-		m[k] = v
+		sm[k] = v
 	}
-	reply.smap = &m
+	reply.smap = &sm
+
+	dm := make(map[int64]uint64, len(kv.maxSrvdIds))
+	for k, v := range kv.maxSrvdIds {
+		dm[k] = v
+	}
+	reply.dmap = &dm
 }
 
 func (kv *ShardKV) handleDupMigrate(state ShardState, shard int, reply *ApplyReply) {
@@ -527,6 +573,10 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 	err = d.Decode(&state)
 	kv.assertf(err == nil, "Failed to decode `state` when applying Migrate, err: %v\n", err)
 
+	if state == SHRD_QUERY { // query op, no side effects
+		return
+	}
+
 	info := &kv.shardInfos[cmd.Shard]
 	infoStr := fmt.Sprintf("info:%+v, shard:%v, cnum:%v, state:%v, clnt:%v",
 		info, cmd.Shard, cnum, state, cmd.ClientId)
@@ -542,8 +592,10 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 			kv.handleDupMigrate(state, cmd.Shard, reply)
 			return
 		}
+		// MOVE_IN -> INVALID means undoing a migration due to a higher config number
 		kv.assertf(info.State == SHRD_MOVE_IN && state == SHRD_VALID ||
-			info.State == SHRD_MOVE_OUT && state == SHRD_INVALID,
+			info.State == SHRD_MOVE_OUT && state == SHRD_INVALID ||
+			info.State == SHRD_MOVE_IN && state == SHRD_INVALID,
 			"[applyMigration] equal assert, %v\n", infoStr)
 	}
 
@@ -572,17 +624,28 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 			setState = false
 		}
 	case SHRD_MOVE_IN:
-		if state == SHRD_MOVE_IN {
+		if state == SHRD_MOVE_OUT {
+			kv.logf("Found an underway migration, we have to wait. %v\n", infoStr)
 			setState = false
-			kv.logf("Found an already moved in shard, might be due to an aborted migration. %v\n",
-				infoStr)
+			setNum = false
+			reply.err = SvWaitMigrate
 		} else {
-			kv.assertf(state == SHRD_VALID, "[applyMigration] MOVE_IN abort, %v\n", infoStr)
+			kv.assertf(info.Cnum == cnum, "[applyMigration] MOVE_IN equal assert, %v\n", infoStr)
+			kv.assertf(state == SHRD_VALID || state == SHRD_INVALID,
+				"[applyMigration] MOVE_IN abort, %v\n", infoStr)
 		}
+		// There couldn't be a MOVE_IN request with a higher config number, because we migrate each
+		// single shard sequentially. What's more, if a MOVE_IN shard has been aborted, the new
+		// elected leader has to pick it up and finish it.
 	case SHRD_MOVE_OUT:
 		if state == SHRD_INVALID {
-			setNum = false
+			kv.assertf(info.Cnum == cnum, "[applyMigration] MOVE_OUT->INVALID abort, %v\n", infoStr)
 			kv.clearShardData(cmd.Shard)
+		} else if state == SHRD_MOVE_OUT {
+			kv.logf("Found shard already moved out, go back to a higher config, %v\n", infoStr)
+			setState = false
+			setNum = false
+			reply.err = SvTryHigherConfig
 		} else {
 			kv.assertf(state == SHRD_MOVE_IN, "[applyMigration] MOVE_OUT abort, %v\n", infoStr)
 		}
@@ -590,14 +653,15 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 		kv.assertf(false, "Invalid info.state, %v\n", infoStr)
 	}
 
-	kv.logf("shard:%v applyMigration from (s:%v, n:%v) to (s:%v, n:%v)\n", cmd.Shard,
-		info.State, info.Cnum, state, cnum)
+	stateStr := fmt.Sprintf("shard:%v applyMigration from (s:%v, n:%v)", cmd.Shard, info.State,
+		info.Cnum)
 	if setState {
 		info.State = state
 	}
 	if setNum {
 		info.Cnum = cnum
 	}
+	kv.logf("%v to (s:%v, n:%v)\n", stateStr, info.State, info.Cnum)
 }
 
 func (kv *ShardKV) applyCommand(cmd *Op, index int) {
@@ -618,20 +682,18 @@ func (kv *ShardKV) applyCommand(cmd *Op, index int) {
 	id, ok := kv.maxSrvdIds[cmd.ClientId]
 	isdup := cmd.Opcode != OP_SHARD_MIGRATE && ok && id >= cmd.RequestId
 
-	if !isdup {
-		switch cmd.Opcode {
-		case OP_GET:
-			kv.applyGet(cmd, &reply)
-		case OP_PUT:
-			fallthrough
-		case OP_APPEND:
-			kv.applyPutAppend(cmd, &reply)
-		case OP_SHARD_MIGRATE:
-			// migrating operations are idempotent, so there will be no duplicate issues
-			kv.applyMigration(cmd, &reply)
-		default:
-			kv.assertf(false, "The applier has got an unknown op: %v\n", cmd.Opcode)
-		}
+	switch cmd.Opcode {
+	case OP_GET:
+		kv.applyGet(cmd, &reply)
+	case OP_PUT:
+		fallthrough
+	case OP_APPEND:
+		kv.applyPutAppend(cmd, &reply)
+	case OP_SHARD_MIGRATE:
+		// migrating operations are idempotent, so there will be no duplicate issues
+		kv.applyMigration(cmd, &reply)
+	default:
+		kv.assertf(false, "The applier has got an unknown op: %v\n", cmd.Opcode)
 	}
 
 	kv.assertf(index == kv.lastAppIdx+1, "raft index out of order! prev:%v, cur:%v\n",
@@ -786,20 +848,28 @@ func (kv *ShardKV) copyLatestConfig(cfg *shardctrler.Config) {
 	}
 }
 
-func (kv *ShardKV) setShardData(shard int, cnum int, smap *map[string]string) {
+func (kv *ShardKV) setShardData(shard int, cnum int, reply *MigrateReply) {
 	kv.logf("Setting shard:%v data, cnum:%v\n", shard, cnum)
 	kv.mu.Lock()
 	info := kv.shardInfos[shard]
 	kv.assertf(info.State == SHRD_MOVE_IN && info.Cnum == cnum,
 		"Invalid state in setShardData, info:%+v, shard:%v, cnum:%v\n", info, shard, cnum)
-	kv.table[shard] = *smap
+	kv.table[shard] = reply.ShardData
+	kv.assertf(len(reply.DedupMap) > 0, "Empty dedup map, info:%+v, shard:%v, cnum:%v\n",
+		info, shard, cnum)
+	for k, v := range reply.DedupMap {
+		lv, ok := kv.maxSrvdIds[k]
+		if !ok || lv < v {
+			kv.maxSrvdIds[k] = v
+		}
+	}
 	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState) bool {
 	args := MigrateArgs{TraceId: atomic.AddUint64(&kv.requestCounter, 1), Shard: shard, Cnum: cnum,
 		Gid: kv.gid, State: state}
-	for {
+	for !kv.killed() {
 		reply := MigrateReply{}
 		kv.logf("markShardState start, args:%+v\n", args)
 		kv.ModifyShard(&args, &reply)
@@ -814,10 +884,6 @@ func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState) bool {
 			fallthrough
 		case ErrWrongLeader:
 			return false
-		case ErrReMigrate:
-			kv.assertf(state == SHRD_VALID && cnum > 1,
-				"ReMigrate can only happen for VALID state, but s:%v, c:%v\n", state, cnum)
-			return kv.migrateShard(shard, cnum)
 		case ErrTimeout:
 			// retry
 		default:
@@ -825,6 +891,7 @@ func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState) bool {
 				kv.gid, reply.Err)
 		}
 	}
+	return false
 }
 
 // @param[in/out] oldCfg The old config we are going to use if it's valid
@@ -836,17 +903,18 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 		Gid: kv.gid, State: state}
 	oldCnum := cnum - 1
 	needQuery := oldCfg.Num == 0
-	for oldCnum > 0 {
+	for oldCnum > 0 && !kv.killed() {
 		kv.logf("[markRemoteShard] quering config number:%v\n", oldCnum)
 		if needQuery {
-			*oldCfg = kv.mck.Query(oldCnum)
+			*oldCfg = shardctrler.Config{}
+			*oldCfg = kv.queryConfig(oldCnum)
 		}
 		destGid := oldCfg.Shards[shard]
 		servers, ok := oldCfg.Groups[destGid]
 		kv.assertf(ok, "[markRemoteShard] Invalid config:%+v\n", oldCfg)
 		sid := 0
 		retry := kv.gid != destGid
-		for retry {
+		for retry && !kv.killed() {
 			srv := kv.make_end(servers[sid%len(servers)])
 			reply := MigrateReply{}
 			kv.logf("ModifyShard request start, (gid:%v, tr:%v), shard:%v, cnum:%v, oldcn:%v,"+
@@ -863,15 +931,23 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 			switch reply.Err {
 			case OK:
 				if state == SHRD_MOVE_OUT && len(reply.ShardData) > 0 {
-					kv.setShardData(shard, cnum, &reply.ShardData)
+					kv.setShardData(shard, cnum, &reply)
 				}
 				return true
 			case ErrWrongLeader:
-				fallthrough
+				sid++
+				if sid%len(servers) == 0 {
+					// wait for leader election
+					time.Sleep(time.Duration(raft.ELECTION_TIME_OUT_LO/2) * time.Millisecond)
+				}
 			case ErrTimeout:
 				sid++
 				if bestEffort && sid >= len(servers) {
 					return false
+				}
+				if sid%len(servers) == 0 {
+					// timeout wait
+					time.Sleep(16 * time.Millisecond)
 				}
 			case ErrAbort:
 				return false
@@ -880,6 +956,12 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 					"[markRemoteShard] UNREACHABLE.shard:%v, cnum:%d, state:%v\n",
 					shard, oldCnum, state)
 				retry = false
+			case ErrTryHigherConfig:
+				// reset the old config num, it will be decremented below
+				oldCnum = cnum
+				retry = false
+			case ErrWaitMigrate:
+				time.Sleep(WAIT_MIGRATE_TIME_OUT * time.Millisecond)
 			}
 		}
 
@@ -892,26 +974,15 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 		oldCnum--
 	}
 
-	// Theorectically, we will either find a higher term or where the shard data is. If we can't
-	// find any way out up above, it's unacceptable and we have to complain it.
-	kv.assertf(false, "markRemoteShard UNREACHABLE. s:%v, cn:%v\n", shard, cnum)
+	// Theorectically, we will either find a way out up above or be killed. Otherwise, it's
+	// unacceptable and we have to complain it.
+	kv.assertf(kv.killed(), "markRemoteShard UNREACHABLE. s:%v, cn:%v\n", shard, cnum)
 	return false
 }
 
 func (kv *ShardKV) migrateShard(shard int, cnum int) bool {
-	kv.mu.Lock()
-	newCnum := kv.config.Num
-	abort := !(cnum <= newCnum && kv.config.Shards[shard] == kv.gid)
-	kv.mu.Unlock()
-
-	if abort {
-		kv.logf("Found higher config num:%v than cnum:%v, abort!\n", newCnum, cnum)
+	if kv.killed() {
 		return false
-	}
-
-	if cnum < newCnum {
-		kv.logf("Found higher config num:%v than cnum:%v, but can continue.\n", newCnum, cnum)
-		cnum = newCnum
 	}
 
 	// Step 1. Mark the local shard state as MOVE_IN
@@ -921,6 +992,7 @@ func (kv *ShardKV) migrateShard(shard int, cnum int) bool {
 	// Step 2. Mark the destination's shard state as MOVE_OUT and pull the shard data from there
 	oldCfg := shardctrler.Config{}
 	if !kv.markRemoteShard(shard, cnum, &oldCfg, SHRD_MOVE_OUT, false) {
+		kv.logf("Marking remote shard MOVE_OUT failed, (shard:%v, cnum:%v)\n", shard, cnum)
 		kv.markLocalShard(shard, cnum, SHRD_INVALID) // best effort, could fail
 		return false
 	}
@@ -951,7 +1023,7 @@ func (kv *ShardKV) getShardInfo(shard int) ShardInfo {
 func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 	kv.logf("Migration starts config:%+v\n", newCfg)
 	carryOn := true
-	for carryOn {
+	for carryOn && !kv.killed() {
 		kv.mu.Lock()
 		kv.assertf(kv.isMigrating,
 			"A migrating goroutine has been waken up without setting the migration flag.\n")
@@ -966,15 +1038,25 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 
 		condFlag := true
 		for i := 0; i < shardctrler.NShards && condFlag; i++ {
+			// Make sure the shard state we are going to read is sufficiently latest.
+			if !kv.markLocalShard(i, newCfg.Num, SHRD_QUERY) {
+				kv.logf("failed to query shard:%v state, newCfg:%+v\n", i, newCfg)
+				break
+			}
 			info := kv.getShardInfo(i)
+			if info.State == SHRD_MOVE_IN && !kv.migrateShard(i, info.Cnum) {
+				// if there are any aborted migration, we have to fix it up
+				kv.logf("failed to fix up shard:%v, info:%+v, newCfg:%+v\n", i, info, newCfg)
+				break
+			}
 			if info.Cnum > newCfg.Num || newCfg.Shards[i] != kv.gid {
 				continue
 			}
 
 			kv.assertf(
-				newCfg.Num != info.Cnum || info.State == SHRD_VALID || info.State == SHRD_MOVE_IN,
+				newCfg.Num > info.Cnum || info.State == SHRD_VALID || info.State == SHRD_MOVE_IN,
 				"Shard:%v info:%+v inconsistent, newCfg:%+v\n", i, info, newCfg)
-			if newCfg.Num == 1 || (newCfg.Num > info.Cnum && info.State == SHRD_VALID) {
+			if newCfg.Num == 1 || info.State == SHRD_VALID {
 				condFlag = kv.markLocalShard(i, newCfg.Num, SHRD_VALID)
 			} else {
 				condFlag = kv.migrateShard(i, newCfg.Num)
@@ -987,7 +1069,7 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 				"another round of migration. flag:%v\n", newCfg.Num, kv.config.Num, condFlag)
 			kv.copyLatestConfig(newCfg)
 			_, carryOn = kv.rf.GetState()
-			kv.isMigrating = carryOn
+			kv.isMigrating = carryOn && !kv.killed()
 		} else {
 			kv.isMigrating = false
 			carryOn = false
@@ -995,13 +1077,13 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 		kv.mu.Unlock()
 	}
 
-	kv.logf("Migration done for config:%v\n", newCfg)
+	kv.logf("Migration exit for config:%v\n", newCfg)
 }
 
 func (kv *ShardKV) pollConfigRoutine() {
 	_, wasLeaderBefore := kv.rf.GetState()
-	for {
-		cfg := kv.mck.Query(-1)
+	for !kv.killed() {
+		cfg := kv.queryConfig(-1)
 		newCfg := shardctrler.Config{Groups: make(map[int][]string, len(cfg.Groups))}
 		needMigrate := false
 		_, isLeader := kv.rf.GetState()
@@ -1031,6 +1113,12 @@ func (kv *ShardKV) pollConfigRoutine() {
 		wasLeaderBefore = isLeader
 		time.Sleep(SV_POLL_CFG_TIME_OUT * time.Millisecond)
 	}
+}
+
+func (kv *ShardKV) queryConfig(num int) shardctrler.Config {
+	kv.ctrlmu.Lock()
+	defer kv.ctrlmu.Unlock()
+	return kv.mck.Query(num)
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -1065,6 +1153,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(ShardInfo{})
 	labgob.Register(map[string]string{})
+	labgob.Register(map[int64]uint64{})
 	labgob.Register([shardctrler.NShards]ShardInfo{})
 	labgob.Register([shardctrler.NShards]map[string]string{})
 
@@ -1080,6 +1169,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 	kv.reqMap = make(map[int64](map[uint64]RequestEntry))
 	kv.requestCounter = 0
+
+	kv.logf("Server starting...\n")
 
 	if persister.SnapshotSize() > 0 {
 		kv.applySnapshot(persister.ReadSnapshot(), 0)
