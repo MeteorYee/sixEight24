@@ -10,17 +10,17 @@ package shardkv
 //
 
 const (
-	OK                 = "OK"
-	ErrNoKey           = "ErrNoKey"
-	ErrWrongGroup      = "ErrWrongGroup"
-	ErrWrongLeader     = "ErrWrongLeader"
-	ErrTimeout         = "ErrTimeout"
-	ErrRenewRequest    = "ErrRenewRequest"
-	ErrRetry           = "ErrRetry"
-	ErrAbort           = "ErrAbort"
-	ErrTryOlderConfig  = "ErrTryOlderConfig"
-	ErrTryHigherConfig = "ErrTryHigherConfig"
-	ErrWaitMigrate     = "ErrWaitMigrate"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrTimeout        = "ErrTimeout"
+	ErrRenewRequest   = "ErrRenewRequest"
+	ErrRetry          = "ErrRetry"
+	ErrAbort          = "ErrAbort"
+	ErrTryOlderConfig = "ErrTryOlderConfig"
+	ErrWaitMigrate    = "ErrWaitMigrate"
+	ErrSkipMigrate    = "ErrSkipMigrate"
 )
 
 const WAIT_MIGRATE_TIME_OUT = 10 // millis
