@@ -21,9 +21,10 @@ const (
 	ErrTryOlderConfig = "ErrTryOlderConfig"
 	ErrWaitMigrate    = "ErrWaitMigrate"
 	ErrSkipMigrate    = "ErrSkipMigrate"
+	ErrShardUninit    = "ErrShardUninit"
 )
 
-const WAIT_MIGRATE_TIME_OUT = 10 // millis
+const WAIT_MIGRATE_TIME_OUT = 32 // millis
 
 type Err string
 

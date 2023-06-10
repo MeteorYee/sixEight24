@@ -54,6 +54,7 @@ const (
 	SvTryOlderConfig
 	SvWaitMigrate
 	SvShardValid
+	SvShardUninit
 )
 
 type Op struct {
@@ -61,6 +62,7 @@ type Op struct {
 	RequestId uint64
 	Shard     int
 	Cnum      int
+	ShrdState ShardState
 	Opcode    uint8
 	Opdata    []byte
 }
@@ -100,6 +102,7 @@ type MigrateArgs struct {
 	Cnum    int
 	Gid     int
 	State   ShardState
+	Data    []byte
 }
 
 type MigrateReply struct {
@@ -213,13 +216,6 @@ func encodePutAppend(key string, value string) []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(key)
 	e.Encode(value)
-	return w.Bytes()
-}
-
-func encodeMigrate(state ShardState) []byte {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(state)
 	return w.Bytes()
 }
 
@@ -360,6 +356,8 @@ func (kv *ShardKV) explainErr4MigrateReply(serr ServerError, mreply *MigrateRepl
 		mreply.Err = ErrWaitMigrate
 	case SvShardValid:
 		mreply.Err = ErrSkipMigrate
+	case SvShardUninit:
+		mreply.Err = ErrShardUninit
 	default:
 		kv.assertf(false, "Got an illegal error code: %v when doing MigrateShard.\n", serr)
 	}
@@ -375,10 +373,11 @@ func (kv *ShardKV) ModifyShard(args *MigrateArgs, reply *MigrateReply) {
 	kv.setRequestChan(clntId, reqId, ch)
 
 	index, term, isLeader := kv.rf.Start(Op{ClientId: clntId, RequestId: reqId,
-		Shard: args.Shard, Cnum: args.Cnum, Opcode: OP_SHARD_MIGRATE,
-		Opdata: encodeMigrate(args.State)})
-	kv.logf("Received ModifyShard args:%+v, (r:%v, c:%v), cnum:%v, index:%v, term:%v\n",
-		*args, reqId, clntId, args.Cnum, index, term)
+		Shard: args.Shard, Cnum: args.Cnum, ShrdState: args.State, Opcode: OP_SHARD_MIGRATE,
+		Opdata: args.Data})
+	kv.logf("Received ModifyShard (gid:%v, tr:%v), (r:%v, c:%v), shard:%v, state:%v, cnum:%v, "+
+		"index:%v, term:%v, dataLen:%v\n", args.Gid, args.TraceId, reqId, clntId, args.Shard,
+		args.State, args.Cnum, index, term, len(args.Data))
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -551,6 +550,27 @@ func (kv *ShardKV) handleDupMigrate(state ShardState, shard int, reply *ApplyRep
 	}
 }
 
+func (kv *ShardKV) setShardData(shard int, cnum int, data []byte) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	sm := make(map[string]string)
+	err := d.Decode(&sm)
+	kv.assertf(err == nil, "Failed to decode `shard data` when applying Migrate, err: %v\n", err)
+	dm := make(map[int64]uint64)
+	err = d.Decode(&dm)
+	kv.assertf(err == nil, "Failed to decode `dedup map` when applying Migrate, err: %v\n", err)
+
+	kv.table[shard] = sm
+	kv.assertf(len(dm) > 0, "Empty dedup map, shard:%v, cnum:%v\n", shard, cnum)
+	for k, v := range dm {
+		lv, ok := kv.maxSrvdIds[k]
+		if !ok || lv < v {
+			kv.maxSrvdIds[k] = v
+		}
+	}
+}
+
 /*
  *      +--------------------(migration done)---------------------+
  *      |                                                         |
@@ -564,13 +584,8 @@ func (kv *ShardKV) handleDupMigrate(state ShardState, shard int, reply *ApplyRep
  *   MOVE_IN ---(migration done)---+
  */
 func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
-	r := bytes.NewBuffer(cmd.Opdata)
-	d := labgob.NewDecoder(r)
-
 	cnum := cmd.Cnum
-	var state ShardState
-	err := d.Decode(&state)
-	kv.assertf(err == nil, "Failed to decode `state` when applying Migrate, err: %v\n", err)
+	state := cmd.ShrdState
 
 	if state == SHRD_QUERY { // query op, no side effects
 		return
@@ -608,7 +623,11 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 		} else if state == SHRD_MOVE_OUT {
 			// The data is not there
 			setState = false
-			reply.err = SvTryOlderConfig
+			if info.Cnum == 0 {
+				reply.err = SvShardUninit
+			} else {
+				reply.err = SvTryOlderConfig
+			}
 		} else {
 			kv.assertf(state == SHRD_MOVE_IN, "[applyMigration] INVALID state abort, %v\n", infoStr)
 		}
@@ -640,6 +659,10 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 		// single shard sequentially. What's more, if a MOVE_IN shard has been aborted, the new
 		// elected leader has to pick it up and finish it. However, if we failed to do the pickup,
 		// we will first modify the shard state as INVALID.
+
+		if state == SHRD_VALID && len(cmd.Opdata) > 0 {
+			kv.setShardData(cmd.Shard, cnum, cmd.Opdata)
+		}
 	case SHRD_MOVE_OUT:
 		if state == SHRD_INVALID {
 			kv.assertf(info.Cnum == cnum, "[applyMigration] MOVE_OUT->INVALID abort, %v\n", infoStr)
@@ -664,7 +687,7 @@ func (kv *ShardKV) applyMigration(cmd *Op, reply *ApplyReply) {
 	if setNum {
 		info.Cnum = cnum
 	}
-	kv.logf("%v to (s:%v, n:%v)\n", stateStr, info.State, info.Cnum)
+	kv.logf("%v to (s:%v, n:%v), dataL:%v\n", stateStr, info.State, info.Cnum, len(cmd.Opdata))
 }
 
 func (kv *ShardKV) applyCommand(cmd *Op, index int) {
@@ -708,10 +731,10 @@ func (kv *ShardKV) applyCommand(cmd *Op, index int) {
 		close(entry.ch)
 	}
 
-	if !isdup {
-		kv.logf("applied command: (r:%v, c:%v), shard:%v idx:%v, clientExists: %v, hasEntry: %v\n",
-			cmd.RequestId, cmd.ClientId, cmd.Shard, index, clientExists, hasEntry)
-	}
+	// if !isdup {
+	// 	kv.logf("applied command: (r:%v, c:%v), shard:%v idx:%v, clientExists: %v, hasEntry: %v\n",
+	// 		cmd.RequestId, cmd.ClientId, cmd.Shard, index, clientExists, hasEntry)
+	// }
 
 	if kv.time4Snapshot() && kv.turnOnSnpshtSwitch() {
 		kv.snpshtcond.Signal()
@@ -846,30 +869,30 @@ func (kv *ShardKV) copyLatestConfig(cfg *shardctrler.Config) {
 	}
 }
 
-func (kv *ShardKV) setShardData(shard int, cnum int, reply *MigrateReply) {
-	kv.logf("Setting shard:%v data, cnum:%v\n", shard, cnum)
-	kv.mu.Lock()
-	info := kv.shardInfos[shard]
-	kv.assertf(info.State == SHRD_MOVE_IN && info.Cnum == cnum,
-		"Invalid state in setShardData, info:%+v, shard:%v, cnum:%v\n", info, shard, cnum)
-	kv.table[shard] = reply.ShardData
-	kv.assertf(len(reply.DedupMap) > 0, "Empty dedup map, info:%+v, shard:%v, cnum:%v\n",
-		info, shard, cnum)
-	for k, v := range reply.DedupMap {
-		lv, ok := kv.maxSrvdIds[k]
-		if !ok || lv < v {
-			kv.maxSrvdIds[k] = v
-		}
-	}
-	kv.mu.Unlock()
+func (kv *ShardKV) encodeShardData(shard int, cnum int, reply *MigrateReply) []byte {
+	kv.logf("Encoding shard:%v data, cnum:%v\n", shard, cnum)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(reply.ShardData)
+	kv.assertf(len(reply.DedupMap) > 0, "Empty dedup map, shard:%v, cnum:%v\n", shard, cnum)
+	e.Encode(reply.DedupMap)
+	return w.Bytes()
 }
 
-func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState, isValid *bool) bool {
+func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState, isValid *bool,
+	data *[]byte) bool {
 	args := MigrateArgs{TraceId: atomic.AddUint64(&kv.requestCounter, 1), Shard: shard, Cnum: cnum,
 		Gid: kv.gid, State: state}
+	if data == nil {
+		args.Data = make([]byte, 0)
+	} else {
+		args.Data = *data
+	}
+
 	for !kv.killed() {
 		reply := MigrateReply{}
-		kv.logf("markShardState start, args:%+v\n", args)
+		kv.logf("markShardState start, (gid:%v, tr:%v), shard:%v, state:%v, cnum:%v, dataLen:%v\n",
+			args.Gid, args.TraceId, args.Shard, args.State, args.Cnum, len(args.Data))
 		kv.ModifyShard(&args, &reply)
 		kv.logf("markShardState end, reply:(tr:%v, err:%v)\n", reply.TraceId, reply.Err)
 
@@ -899,8 +922,8 @@ func (kv *ShardKV) markLocalShard(shard int, cnum int, state ShardState, isValid
 }
 
 // @param[in/out] oldCfg The old config we are going to use if it's valid
-func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Config, state ShardState,
-	bestEffort bool) bool {
+func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Config, data *[]byte,
+	state ShardState, bestEffort bool) bool {
 
 	kv.assertf(cnum > 1, "Invaild cnum:%v\n", cnum)
 	args := MigrateArgs{TraceId: atomic.AddUint64(&kv.requestCounter, 1), Shard: shard, Cnum: cnum,
@@ -908,6 +931,7 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 	oldCnum := cnum - 1
 	needQuery := oldCfg.Num == 0
 	destGid := -1
+	isShardUninit := false
 	for oldCnum > 0 && !kv.killed() {
 		kv.logf("[markRemoteShard] quering config number:%v\n", oldCnum)
 		if needQuery {
@@ -918,12 +942,14 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 			oldCnum--
 			continue
 		}
+
 		destGid = oldCfg.Shards[shard]
 		servers, ok := oldCfg.Groups[destGid]
 		kv.assertf(ok, "[markRemoteShard] Invalid config:%+v\n", oldCfg)
 		sid := 0
 		retry := kv.gid != destGid
 		for retry && !kv.killed() {
+			isShardUninit = false
 			srv := kv.make_end(servers[sid%len(servers)])
 			reply := MigrateReply{}
 			kv.logf("ModifyShard request start, (gid:%v, tr:%v), shard:%v, cnum:%v, oldcn:%v,"+
@@ -940,9 +966,15 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 			switch reply.Err {
 			case OK:
 				if state == SHRD_MOVE_OUT && len(reply.ShardData) > 0 {
-					kv.setShardData(shard, cnum, &reply)
+					kv.assertf(data != nil, "Invalid data address, (gid:%v, tr:%v)\n", kv.gid,
+						args.TraceId)
+					*data = kv.encodeShardData(shard, cnum, &reply)
 				}
 				return true
+			case ErrShardUninit:
+				// we've found an uninitialized shard state, if old cnum > 1, we have to continue
+				isShardUninit = true
+				retry = false
 			case ErrWrongLeader:
 				sid++
 				if sid%len(servers) == 0 {
@@ -970,15 +1002,15 @@ func (kv *ShardKV) markRemoteShard(shard int, cnum int, oldCfg *shardctrler.Conf
 			}
 		}
 
-		if oldCnum == 1 && destGid == kv.gid {
-			// The shard belongs to us because we've found the very first config.
-			kv.logf("Traversed all the configs, found shard:%v belongs to us, cnum:%d, state:%v\n",
-				shard, oldCnum, state)
-			return true
-		}
 		oldCnum--
 	}
 
+	if destGid == kv.gid || isShardUninit {
+		// The shard belongs to us because we've found the very first config.
+		kv.logf("Traversed all the configs, found shard:%v belongs to us, cnum:%d, state:%v\n",
+			shard, oldCnum, state)
+		return true
+	}
 	// Theorectically, we will either find a way out up above or be killed. Otherwise, it's
 	// unacceptable and we have to complain it.
 	kv.assertf(kv.killed(), "markRemoteShard UNREACHABLE. s:%v, cn:%v\n", shard, cnum)
@@ -992,7 +1024,7 @@ func (kv *ShardKV) migrateShard(shard int, cnum int) bool {
 
 	isValid := false
 	// Step 1. Mark the local shard state as MOVE_IN
-	if !kv.markLocalShard(shard, cnum, SHRD_MOVE_IN, &isValid) {
+	if !kv.markLocalShard(shard, cnum, SHRD_MOVE_IN, &isValid, nil) {
 		return false
 	}
 	if isValid {
@@ -1002,13 +1034,14 @@ func (kv *ShardKV) migrateShard(shard int, cnum int) bool {
 
 	// Step 2. Mark the destination's shard state as MOVE_OUT and pull the shard data from there
 	oldCfg := shardctrler.Config{}
-	if !kv.markRemoteShard(shard, cnum, &oldCfg, SHRD_MOVE_OUT, false) {
+	shardData := make([]byte, 0)
+	if !kv.markRemoteShard(shard, cnum, &oldCfg, &shardData, SHRD_MOVE_OUT, false) {
 		kv.logf("Marking remote shard MOVE_OUT failed, (shard:%v, cnum:%v)\n", shard, cnum)
-		kv.markLocalShard(shard, cnum, SHRD_INVALID, nil) // best effort, could fail
+		kv.markLocalShard(shard, cnum, SHRD_INVALID, nil, nil) // best effort, could fail
 		return false
 	}
 	// Step 3. Mark the shard as VALID
-	if !kv.markLocalShard(shard, cnum, SHRD_VALID, nil) {
+	if !kv.markLocalShard(shard, cnum, SHRD_VALID, nil, &shardData) {
 		kv.logf("Marking shard VALID for step 3 failed. (shard:%v, cnum:%v)\n", shard, cnum)
 		return false
 	}
@@ -1020,7 +1053,7 @@ func (kv *ShardKV) migrateShard(shard int, cnum int) bool {
 	// Step 4. Mark the destination's shard state as INVALID and delete the data, but it executes
 	// in a best effort way. Ideally, there should be a periodic GC routine on the other side to
 	// ensure the stale data can be reclaimed finally.
-	kv.markRemoteShard(shard, cnum, &oldCfg, SHRD_INVALID, true)
+	kv.markRemoteShard(shard, cnum, &oldCfg, nil, SHRD_INVALID, true)
 	return true
 }
 
@@ -1051,7 +1084,7 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 		condFlag := true
 		for i := 0; i < shardctrler.NShards && condFlag; i++ {
 			// Make sure the shard state we are going to read is sufficiently latest.
-			if !kv.markLocalShard(i, newCfg.Num, SHRD_QUERY, nil) {
+			if !kv.markLocalShard(i, newCfg.Num, SHRD_QUERY, nil, nil) {
 				kv.logf("failed to query shard:%v state, newCfg:%+v\n", i, newCfg)
 				break
 			}
@@ -1062,7 +1095,8 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 				// migration, we can still safely continue.
 				kv.logf("failed to fix up shard:%v, info:%+v, newCfg:%+v\n", i, info, newCfg)
 			}
-			if info.Cnum > newCfg.Num || newCfg.Shards[i] != kv.gid {
+			if info.Cnum > newCfg.Num || newCfg.Shards[i] != kv.gid ||
+				(info.Cnum == newCfg.Num && info.State == SHRD_VALID) {
 				continue
 			}
 
@@ -1070,7 +1104,7 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 				newCfg.Num > info.Cnum || info.State == SHRD_VALID || info.State == SHRD_MOVE_IN,
 				"Shard:%v info:%+v inconsistent, newCfg:%+v\n", i, info, newCfg)
 			if newCfg.Num == 1 {
-				condFlag = kv.markLocalShard(i, newCfg.Num, SHRD_VALID, nil)
+				condFlag = kv.markLocalShard(i, newCfg.Num, SHRD_VALID, nil, nil)
 			} else {
 				condFlag = kv.migrateShard(i, newCfg.Num)
 			}
