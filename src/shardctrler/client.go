@@ -25,6 +25,7 @@ type Clerk struct {
 	requestCounter uint64
 	clct           int // continuous leader changed times
 	retryCount     uint32
+	dead           int32 // set by Kill()
 }
 
 func nrand() int64 {
@@ -84,12 +85,21 @@ func (ck *Clerk) handleReply(rpcOK bool, err Err) (success bool) {
 	return
 }
 
+func (ck *Clerk) Kill() {
+	atomic.StoreInt32(&ck.dead, 1)
+}
+
+func (ck *Clerk) killed() bool {
+	z := atomic.LoadInt32(&ck.dead)
+	return z == 1
+}
+
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	args.ClientId = ck.clientId
 	args.Num = num
 
-	for {
+	for !ck.killed() {
 		// Query doesn't care about the duplicates.
 		args.RequestId = atomic.AddUint64(&ck.requestCounter, 1)
 
@@ -107,6 +117,8 @@ func (ck *Clerk) Query(num int) Config {
 			return reply.Config
 		}
 	}
+
+	return Config{Num: -1}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
@@ -115,7 +127,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args.RequestId = atomic.AddUint64(&ck.requestCounter, 1)
 	args.Servers = servers
 
-	for {
+	for !ck.killed() {
 		srv := ck.servers[ck.lastLeaderId]
 		var reply JoinReply
 		DPrintf("clnt:%v Join request start, (r:%v, c:%v), servers:%v, clct: %v\n", args.ClientId,
@@ -138,7 +150,7 @@ func (ck *Clerk) Leave(gids []int) {
 	args.RequestId = atomic.AddUint64(&ck.requestCounter, 1)
 	args.GIDs = gids
 
-	for {
+	for !ck.killed() {
 		srv := ck.servers[ck.lastLeaderId]
 		var reply LeaveReply
 		DPrintf("clnt:%v Leave request start, (r:%v, c:%v), GIDs:%v, clct: %v\n", args.ClientId,
@@ -162,7 +174,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 	args.Shard = shard
 	args.GID = gid
 
-	for {
+	for !ck.killed() {
 		srv := ck.servers[ck.lastLeaderId]
 		var reply MoveReply
 		DPrintf("clnt:%v Move request start, (r:%v, c:%v), s:%v->g:%v, clct: %v\n", args.ClientId,
