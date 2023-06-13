@@ -447,16 +447,16 @@ func (kv *ShardKV) assertf(assertion bool, format string, a ...interface{}) {
 func (kv *ShardKV) applyCheckState(shard int, cnum int) (err ServerError) {
 	info := kv.shardInfos[shard]
 	if info.Cnum > cnum {
-		err = SvWrongGroup
-	} else if info.Cnum < cnum {
-		err = SvRetry
-	} else {
+		err = SvWrongGroup // wait for migration
+	} else { // we allow the clients to have higher config number
 		switch info.State {
 		case SHRD_MOVE_IN:
 			err = SvRetry
 		case SHRD_VALID:
 			err = SvOK
 		case SHRD_INVALID:
+			fallthrough
+		case SHRD_MOVE_OUT:
 			err = SvWrongGroup
 		default:
 			kv.assertf(false, "Illegal state:%v\n", info.State)
@@ -1150,6 +1150,47 @@ func (kv *ShardKV) fixMoveOutShard(shard int, cnum int) {
 	}
 }
 
+func (kv *ShardKV) fetchShardRoutine(newCfg *shardctrler.Config, shard int, condCh chan<- interface{}) {
+	success := true
+	kv.logf("Migration shard:%v start with config num:%v\n", shard, newCfg.Num)
+	defer func() {
+		kv.logf("Migration shard:%v end with config num:%v, success:%v\n", shard, newCfg.Num, success)
+		condCh <- success
+	}()
+
+	// Make sure the shard state we are going to read is sufficiently latest.
+	if !kv.markLocalShard(shard, newCfg.Num, SHRD_QUERY, nil, nil) {
+		kv.logf("failed to query shard:%v state, newCfg:%+v\n", shard, newCfg)
+		success = false
+		return
+	}
+
+	info := kv.getShardInfo(shard)
+	if info.State == SHRD_MOVE_IN && info.Cnum < newCfg.Num &&
+		!kv.migrateShard(shard, info.Cnum) {
+		// If there are any aborted migration, we try to fix it up. Had we failed to fix
+		// the state, it means the remote had not been marked as MOVE_OUT by the older
+		// migration, we can still safely continue.
+		kv.logf("failed to fix up shard:%v, info:%+v, newCfg:%+v\n", shard, info, newCfg)
+	}
+	if info.State == SHRD_MOVE_OUT {
+		kv.fixMoveOutShard(shard, info.Cnum)
+	}
+	info = kv.getShardInfo(shard) // refresh the info
+	if info.Cnum > newCfg.Num || newCfg.Shards[shard] != kv.gid ||
+		(info.Cnum == newCfg.Num && info.State == SHRD_VALID) {
+		return
+	}
+
+	kv.assertf(newCfg.Num > info.Cnum || info.State == SHRD_VALID || info.State == SHRD_MOVE_IN,
+		"Shard:%v info:%+v inconsistent, newCfg:%+v\n", shard, info, newCfg)
+	if newCfg.Num == 1 {
+		success = kv.markLocalShard(shard, newCfg.Num, SHRD_VALID, nil, nil)
+	} else {
+		success = kv.migrateShard(shard, newCfg.Num)
+	}
+}
+
 func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 	kv.logf("Migration enter with config:%+v\n", newCfg)
 	carryOn := true
@@ -1167,45 +1208,23 @@ func (kv *ShardKV) migrateRoutine(newCfg *shardctrler.Config) {
 		kv.mu.Unlock()
 
 		kv.logf("Migration start with config:%+v\n", newCfg)
-		condFlag := true
-		for i := 0; i < shardctrler.NShards && condFlag; i++ {
-			// Make sure the shard state we are going to read is sufficiently latest.
-			if !kv.markLocalShard(i, newCfg.Num, SHRD_QUERY, nil, nil) {
-				kv.logf("failed to query shard:%v state, newCfg:%+v\n", i, newCfg)
-				break
-			}
-			info := kv.getShardInfo(i)
-			if info.State == SHRD_MOVE_IN && info.Cnum < newCfg.Num &&
-				!kv.migrateShard(i, info.Cnum) {
-				// If there are any aborted migration, we try to fix it up. Had we failed to fix
-				// the state, it means the remote had not been marked as MOVE_OUT by the older
-				// migration, we can still safely continue.
-				kv.logf("failed to fix up shard:%v, info:%+v, newCfg:%+v\n", i, info, newCfg)
-			}
-			if info.State == SHRD_MOVE_OUT {
-				kv.fixMoveOutShard(i, info.Cnum)
-			}
-			info = kv.getShardInfo(i) // refresh the info
-			if info.Cnum > newCfg.Num || newCfg.Shards[i] != kv.gid ||
-				(info.Cnum == newCfg.Num && info.State == SHRD_VALID) {
-				continue
-			}
-
-			kv.assertf(
-				newCfg.Num > info.Cnum || info.State == SHRD_VALID || info.State == SHRD_MOVE_IN,
-				"Shard:%v info:%+v inconsistent, newCfg:%+v\n", i, info, newCfg)
-			if newCfg.Num == 1 {
-				condFlag = kv.markLocalShard(i, newCfg.Num, SHRD_VALID, nil, nil)
-			} else {
-				condFlag = kv.migrateShard(i, newCfg.Num)
-			}
+		// this is hacky, but it's fine for now, we only have 10 shards...
+		kv.assertf(shardctrler.NShards <= 10,
+			"If you changed the number of shards in total, think about the logic below\n.")
+		condCh := make(chan interface{}, shardctrler.NShards)
+		for i := 1; i < shardctrler.NShards; i++ {
+			go kv.fetchShardRoutine(newCfg, i, condCh)
 		}
-		kv.logf("Migration end with config num:%v, cond:%v\n", newCfg.Num, condFlag)
+		kv.fetchShardRoutine(newCfg, 0, condCh)
+		for i := 0; i < shardctrler.NShards; i++ {
+			<-condCh
+		}
+		kv.logf("Migration end with config num:%v\n", newCfg.Num)
 
 		kv.mu.Lock()
 		if newCfg.Num < kv.config.Num {
 			kv.logf("Migrating goroutine whose config num:%v found a higher one:%v, will do"+
-				"another round of migration. flag:%v\n", newCfg.Num, kv.config.Num, condFlag)
+				"another round of migration.\n", newCfg.Num, kv.config.Num)
 			kv.copyLatestConfig(newCfg)
 			_, carryOn = kv.rf.GetState()
 			kv.isMigrating = carryOn && !kv.killed()
